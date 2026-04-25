@@ -167,7 +167,11 @@ bool tp_gettuple(IndexScanDesc scan, ScanDirection dir);
 /*
  * Parallel scan callbacks (am/scan.c).
  */
+#if PG_VERSION_NUM >= 180000
+Size tp_estimateparallelscan(Relation rel, int nkeys, int norderbys);
+#else
 Size tp_estimateparallelscan(int nkeys, int norderbys);
+#endif
 void tp_initparallelscan(void *target);
 void tp_parallelrescan(IndexScanDesc scan);
 

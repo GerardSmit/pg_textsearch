@@ -60,8 +60,8 @@ typedef struct TpParallelWorkerSlot
 
 /*
  * Shared region laid down at the start of the AM-specific DSM area.
- * Workers reach this via &scan->parallel_scan->ps_snapshot_data[
- *     scan->parallel_scan->ps_offset].
+ * Workers reach this via OffsetToPointer(scan->parallel_scan,
+ *     scan->parallel_scan->ps_offset[_am]).
  *
  * The leader populates everything except next_segment_index /
  * workers_done before launching workers.  After fan-out the leader

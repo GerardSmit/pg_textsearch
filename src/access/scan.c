@@ -188,8 +188,14 @@ tp_parallel_scan_size(void)
 }
 
 Size
+#if PG_VERSION_NUM >= 180000
+tp_estimateparallelscan(Relation rel, int nkeys, int norderbys)
+{
+	(void)rel;
+#else
 tp_estimateparallelscan(int nkeys, int norderbys)
 {
+#endif
 	(void)nkeys;
 	(void)norderbys;
 	return tp_parallel_scan_size();
@@ -215,8 +221,15 @@ tp_parallelrescan(IndexScanDesc scan)
 		return;
 
 	{
+#if PG_VERSION_NUM >= 180000
 		TpParallelScan *pscan = (TpParallelScan *)OffsetToPointer(
-				(void *)scan->parallel_scan, scan->parallel_scan->ps_offset);
+				(void *)scan->parallel_scan,
+				scan->parallel_scan->ps_offset_am);
+#else
+		TpParallelScan *pscan = (TpParallelScan *)OffsetToPointer(
+				(void *)scan->parallel_scan,
+				scan->parallel_scan->ps_offset);
+#endif
 
 		pg_atomic_write_u32(&pscan->setup_done, 0);
 		pg_atomic_write_u32(&pscan->next_segment_index, 0);
@@ -357,8 +370,15 @@ tp_get_parallel_scan(IndexScanDesc scan)
 {
 	if (!scan->parallel_scan)
 		return NULL;
+#if PG_VERSION_NUM >= 180000
 	return (TpParallelScan *)OffsetToPointer(
-			(void *)scan->parallel_scan, scan->parallel_scan->ps_offset);
+			(void *)scan->parallel_scan,
+			scan->parallel_scan->ps_offset_am);
+#else
+	return (TpParallelScan *)OffsetToPointer(
+			(void *)scan->parallel_scan,
+			scan->parallel_scan->ps_offset);
+#endif
 }
 
 /*

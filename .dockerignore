@@ -1,4 +1,5 @@
 .git
+.github
 test/results
 test/regression.diffs
 test/regression.out
@@ -10,4 +11,7 @@ coverage.info
 *.o
 *.bc
 *.so
-benchmarks/datasets
+benchmarks/
+CLAUDE.md
+CONTRIBUTING.md
+RELEASING.md

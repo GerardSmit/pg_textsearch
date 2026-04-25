@@ -1,9 +1,9 @@
 name: Coverity
 
 on:
-  schedule:
-    # Run weekly on Saturday at 22:00 UTC
-    - cron: '0 22 * * SAT'
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types: [completed]
   push:
     branches:
       - coverity_scan

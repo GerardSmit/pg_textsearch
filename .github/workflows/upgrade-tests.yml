@@ -7,15 +7,15 @@ on:
         description: 'Target version to test upgrades to (leave empty for current branch)'
         required: false
         type: string
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types: [completed]
   pull_request:
     paths:
       - 'sql/**'
       - 'src/segment/**'
       - 'pg_textsearch.control'
       - '.github/workflows/upgrade-tests.yml'
-  schedule:
-    # Run weekly on Sundays at 2 AM UTC
-    - cron: '0 2 * * 0'
 
 jobs:
   test-upgrades:

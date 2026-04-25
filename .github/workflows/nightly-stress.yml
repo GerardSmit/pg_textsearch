@@ -9,9 +9,9 @@
 name: Nightly Stress Tests
 
 on:
-  schedule:
-    # Run at 5 AM UTC daily (9 PM Pacific)
-    - cron: '0 5 * * *'
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       duration_minutes:

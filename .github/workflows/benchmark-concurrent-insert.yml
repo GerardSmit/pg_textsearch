@@ -8,13 +8,9 @@ env:
   PARADEDB_VERSION: "0.21.6"
 
 on:
-  # TODO: remove push trigger before merging
-  push:
-    branches:
-      - benchmark/concurrent-insert-runner
-
-  schedule:
-    - cron: '0 7 * * *'  # Daily at 7 AM UTC (after main benchmarks)
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types: [completed]
 
   workflow_dispatch:
     inputs:
