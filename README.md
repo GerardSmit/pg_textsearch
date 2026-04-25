@@ -5,6 +5,8 @@
 
 Modern ranked text search for Postgres. Fork of [timescale/pg_textsearch](https://github.com/timescale/pg_textsearch) with additional features and a Docker-first distribution.
 
+### Core features (from upstream)
+
 - Simple syntax: `ORDER BY content <@> 'search terms'`
 - BM25 ranking with configurable parameters (k1, b)
 - Works with Postgres text search configurations (english, french, german, etc.)
@@ -13,17 +15,19 @@ Modern ranked text search for Postgres. Fork of [timescale/pg_textsearch](https:
 - Fast top-k queries via Block-Max WAND optimization
 - Parallel index builds for large tables
 - Supports partitioned tables
-- **Advanced queries**: prefix (`foo*`), phrase (`"foo bar"`),
-  field-scoped (`title:foo`), and fuzzy (`fuzzy_max_distance => 1`) —
-  all via `to_bm25query(..., grammar => true)`
-- **Highlighting**: `bm25_snippet()` for search result snippets,
-  `bm25_snippet_positions()` for byte-offset ranges,
-  `bm25_headline()` for structured JSON output across multi-column indexes
-- **Content normalization**: index HTML and Markdown content with automatic
-  tag/syntax stripping via `content_format` index option
+
+### New in this fork
+
+- **Multi-column BM25F indexes** with per-field weights and field-scoped queries (`title:foo`)
+- **Query grammar**: prefix (`foo*`), phrase (`"foo bar"`), phrase-prefix (`"foo bar*"`), field scope (`title:foo`), grouping (`title:(hello world)`), escaping (`\:`)
+- **Fuzzy search**: Levenshtein distance expansion (`fuzzy_max_distance => 1`)
+- **Highlighting with zero-arg convenience**:
+  - `bm25_snippet()` / `bm25_snippet('field')` — text snippets inferred from active scan
+  - `bm25_snippet_positions()` / `bm25_snippet_positions('field')` — byte-offset ranges
+  - `bm25_headline()` — structured JSON with per-field snippets, positions, and match details
+- **Content normalization**: index HTML/Markdown with automatic tag stripping (`content_format` option), highlight positions map back to original source bytes
 - **Parallel index scan** for 10M+ row indexes (up to 3x speedup)
-- **Bundled extensions**: pgvector (vector similarity search) and pg_trgm
-  (trigram matching) pre-installed in Docker image
+- **Docker image**: pgvector + pg_trgm pre-installed, auto-configured
 
 ![Tapir and Friends](images/tapir_and_friends_v1.1.0.png)
 
@@ -250,38 +254,50 @@ Backslash escapes grammar characters when `grammar => true`:
 
 ### Highlighting
 
-Render search result snippets with matched terms highlighted:
+When used inside an `ORDER BY ... <@>` query, highlighting functions
+automatically infer the query, index, and columns from the active scan
+— no arguments needed:
 
 ```sql
-SELECT
-    bm25_snippet(title, to_bm25query('hello', 'articles_idx'),
-        field_name => 'title') AS snippet,
-    bm25_snippet_positions(title, to_bm25query('hello', 'articles_idx'),
-        field_name => 'title') AS positions
+-- Single-column index: zero-arg snippet
+SELECT bm25_snippet()
+FROM documents
+ORDER BY content <@> to_bm25query('database', 'docs_idx')
+LIMIT 10;
+
+-- Multi-column index: specify field name
+SELECT bm25_snippet('title'), bm25_snippet('body')
+FROM articles
+ORDER BY (title, body) <@> to_bm25query('hello', 'articles_idx')
+LIMIT 10;
+
+-- Byte-offset positions (same pattern)
+SELECT bm25_snippet_positions('title')
 FROM articles
 ORDER BY (title, body) <@> to_bm25query('hello', 'articles_idx')
 LIMIT 10;
 ```
 
-Positions are `int4range[]` byte offsets (`[start, end)`). Custom tags
-via `start_tag`/`end_tag`, fragment length via `max_num_chars`.
+Positions are `int4range[]` byte offsets (`[start, end)`). The explicit
+form is still available for standalone use:
+
+```sql
+bm25_snippet(document, query, index_name, start_tag, end_tag, max_num_chars, ...)
+```
 
 #### `bm25_headline` — structured JSON output
 
-For multi-column indexes, `bm25_headline` returns a JSON object with
-per-field snippets, match positions, and matched terms:
+Returns a JSON object with per-field snippets, positions, and matched terms.
+Zero-arg form infers everything from the scan:
 
 ```sql
-SELECT bm25_headline(
-    to_bm25query('title:hello body:search*', 'articles_idx', grammar => true),
-    'articles_idx',
-    VARIADIC ARRAY[title, body])
+SELECT bm25_headline()
 FROM articles
 ORDER BY (title, body) <@> to_bm25query('title:hello body:search*', 'articles_idx', grammar => true)
 LIMIT 10;
 ```
 
-Returns JSON like:
+Returns:
 
 ```json
 {
@@ -302,10 +318,10 @@ Returns JSON like:
 }
 ```
 
-Each field entry contains:
-- `snippet` — highlighted text with `<b>` tags (customizable via `start_tag`/`end_tag`)
-- `positions` — `[start, end)` byte offsets of matched terms
-- `matches` — array of match details: term, offsets, match type, and original text
+The explicit form is also available:
+```sql
+bm25_headline(query, index_name, VARIADIC ARRAY[col1, col2, ...])
+```
 
 ### Content Normalization (HTML / Markdown)
 
@@ -945,12 +961,17 @@ superuser privileges.
 
 Function | Description
 --- | ---
-bm25_snippet(content, query, ...) → text | Highlighted snippet with `<b>` tags (customizable)
-bm25_snippet(content, query_text, ...) → text | Text-query variant (auto-creates bm25query)
-bm25_snippet_positions(content, query, ...) → int4range[] | Byte-offset ranges of matched terms
-bm25_headline(query, index_name, VARIADIC columns) → jsonb | Per-field JSON with snippets, positions, and match details
+bm25_snippet() → text | Snippet from active scan (single-column index)
+bm25_snippet(field_name) → text | Snippet for named field (multi-column index)
+bm25_snippet(content, query, ...) → text | Explicit form with all parameters
+bm25_snippet_positions() → int4range[] | Byte-offset ranges from active scan (single-column)
+bm25_snippet_positions(field_name) → int4range[] | Byte-offset ranges for named field (multi-column)
+bm25_snippet_positions(content, query, ...) → int4range[] | Explicit form with all parameters
+bm25_headline() → jsonb | Per-field JSON from active scan
+bm25_headline(query, index_name, VARIADIC columns) → jsonb | Explicit form with all parameters
 
-Optional parameters for `bm25_snippet`: `field_name`, `start_tag`, `end_tag`, `max_num_chars`.
+Zero-arg and field-name forms require an active `ORDER BY ... <@>` scan.
+Optional parameters for explicit `bm25_snippet`: `field_name`, `start_tag`, `end_tag`, `max_num_chars`.
 
 #### Maintenance Functions
 
