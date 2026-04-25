@@ -618,9 +618,10 @@ test_cross_user_pressure_spill() {
 test_concurrent_spills() {
     log "Test 5: Concurrent spills from multiple backends"
 
-    # Tight per-index limit so each backend spills.
+    # Per-index limit so each backend spills. Must be large enough for
+    # 4 concurrent backends to allocate DSA memory before auto-spill.
     run_sql_quiet "ALTER SYSTEM SET pg_textsearch.memory_limit
-                       = '4MB';"
+                       = '32MB';"
     reload_conf
 
     local N=4
