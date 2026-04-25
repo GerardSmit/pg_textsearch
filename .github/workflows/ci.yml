@@ -392,6 +392,10 @@ jobs:
         fi
         rm -f test_sanitizer test_sanitizer.c
 
+        # Clean up sanitizer logs from the self-test so they don't
+        # cause false failures during actual test log collection.
+        rm -f ${{ github.workspace }}/sanitizer_logs/*
+
     - name: Build and install pg_textsearch
       run: |
         export PATH="$HOME/$PG_INSTALL_DIR/bin:$PATH"
