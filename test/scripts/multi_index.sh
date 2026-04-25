@@ -362,9 +362,8 @@ test_cross_schema() {
 test_non_owner_spill() {
     log "Test 3: Non-owner INSERT triggers auto-spill"
 
-    # Tighten per-index limit so spill triggers quickly.
-    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.memory_limit
-                       = '4MB';"
+    # Lower threshold so spill triggers quickly.
+    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.bulk_load_threshold = 5000;"
     reload_conf
 
     # Create roles.
@@ -478,9 +477,8 @@ test_non_owner_spill() {
 test_cross_user_pressure_spill() {
     log "Test 4: Cross-user memory pressure spill"
 
-    # Tight global limit: 4MB total, per-index soft = 512kB.
-    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.memory_limit
-                       = '4MB';"
+    # Lower threshold so spill triggers quickly under memory pressure.
+    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.bulk_load_threshold = 5000;"
     reload_conf
 
     # Create two owner roles.
@@ -799,8 +797,7 @@ test_query_during_spill() {
 test_mixed_workload() {
     log "Test 7: Mixed workload across many indexes"
 
-    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.memory_limit
-                       = '4MB';"
+    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.bulk_load_threshold = 5000;"
     reload_conf
 
     # Create schemas and roles.
