@@ -90,21 +90,21 @@ SELECT bm25_snippet(title, 'hello', 'highlight_docs_idx')
 FROM highlight_docs WHERE id = 1;
 
 -- JSON helper returns one object keyed by index field names.
-SELECT bm25_highlights(
+SELECT bm25_headline(
   to_bm25query('title:hello body:brav*', 'highlight_docs_idx', grammar => true),
   'highlight_docs_idx',
   VARIADIC ARRAY[title, body])
 FROM highlight_docs WHERE id = 1;
 
 -- NULL fields produce empty JSON entries.
-SELECT bm25_highlights(
+SELECT bm25_headline(
   to_bm25query('hello', 'highlight_docs_idx'),
   'highlight_docs_idx',
   VARIADIC ARRAY[title, body])
 FROM highlight_docs WHERE id = 3;
 
--- Zero-arg bm25_highlights(): query, index, columns inferred from scan.
-SELECT bm25_highlights()
+-- Zero-arg bm25_headline(): query, index, columns inferred from scan.
+SELECT bm25_headline()
 FROM highlight_docs
 ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
 LIMIT 2;

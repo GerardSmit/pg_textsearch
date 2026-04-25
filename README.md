@@ -18,7 +18,7 @@ Modern ranked text search for Postgres. Fork of [timescale/pg_textsearch](https:
   all via `to_bm25query(..., grammar => true)`
 - **Highlighting**: `bm25_snippet()` for search result snippets,
   `bm25_snippet_positions()` for byte-offset ranges,
-  `bm25_highlights()` for structured JSON output across multi-column indexes
+  `bm25_headline()` for structured JSON output across multi-column indexes
 - **Content normalization**: index HTML and Markdown content with automatic
   tag/syntax stripping via `content_format` index option
 - **Parallel index scan** for 10M+ row indexes (up to 3x speedup)
@@ -266,13 +266,13 @@ LIMIT 10;
 Positions are `int4range[]` byte offsets (`[start, end)`). Custom tags
 via `start_tag`/`end_tag`, fragment length via `max_num_chars`.
 
-#### `bm25_highlights` — structured JSON output
+#### `bm25_headline` — structured JSON output
 
-For multi-column indexes, `bm25_highlights` returns a JSON object with
+For multi-column indexes, `bm25_headline` returns a JSON object with
 per-field snippets, match positions, and matched terms:
 
 ```sql
-SELECT bm25_highlights(
+SELECT bm25_headline(
     to_bm25query('title:hello body:search*', 'articles_idx', grammar => true),
     'articles_idx',
     VARIADIC ARRAY[title, body])
@@ -344,7 +344,7 @@ CREATE INDEX articles_idx ON articles USING bm25(title, summary, body)
 Valid formats: `plain` (default), `html`, `markdown`.
 
 Snippets (`bm25_snippet`) render against the normalized (stripped) text for
-display. Positions (`bm25_snippet_positions`, `bm25_highlights`) map back to
+display. Positions (`bm25_snippet_positions`, `bm25_headline`) map back to
 byte offsets in the **original** HTML/Markdown source, so callers can
 highlight their stored content directly.
 
@@ -948,7 +948,7 @@ Function | Description
 bm25_snippet(content, query, ...) → text | Highlighted snippet with `<b>` tags (customizable)
 bm25_snippet(content, query_text, ...) → text | Text-query variant (auto-creates bm25query)
 bm25_snippet_positions(content, query, ...) → int4range[] | Byte-offset ranges of matched terms
-bm25_highlights(query, index_name, VARIADIC columns) → jsonb | Per-field JSON with snippets, positions, and match details
+bm25_headline(query, index_name, VARIADIC columns) → jsonb | Per-field JSON with snippets, positions, and match details
 
 Optional parameters for `bm25_snippet`: `field_name`, `start_tag`, `end_tag`, `max_num_chars`.
 

@@ -390,21 +390,21 @@ RETURNS int4range[]
 AS 'MODULE_PATHNAME', 'bm25_snippet_positions_text'
 LANGUAGE C STABLE PARALLEL SAFE;
 
-CREATE FUNCTION @extschema@.bm25_highlights(
+CREATE FUNCTION @extschema@.bm25_headline(
     query @extschema@.bm25query,
     index_name text,
     VARIADIC fields text[])
 RETURNS jsonb
-AS 'MODULE_PATHNAME', 'bm25_highlights'
+AS 'MODULE_PATHNAME', 'bm25_headline'
 LANGUAGE C STABLE PARALLEL SAFE;
 
 -- Zero-arg overloads: query, index, and columns inferred from the active
 -- bm25 index scan. The planner rewrites these to the explicit forms.
 -- If no scan is active, they error with a helpful message.
 
-CREATE FUNCTION @extschema@.bm25_highlights()
+CREATE FUNCTION @extschema@.bm25_headline()
 RETURNS jsonb
-AS 'MODULE_PATHNAME', 'bm25_highlights_auto'
+AS 'MODULE_PATHNAME', 'bm25_headline_auto'
 LANGUAGE C VOLATILE PARALLEL SAFE;
 
 CREATE FUNCTION @extschema@.bm25_snippet()

@@ -824,14 +824,14 @@ FROM markup_3c WHERE id = 1;
 (1 row)
 
 -- ============================================================
--- 21. bm25_highlights JSON on normalized multi-column
+-- 21. bm25_headline JSON on normalized multi-column
 -- ============================================================
-SELECT bm25_highlights(
+SELECT bm25_headline(
   to_bm25query('emphasis', 'markup_3c_hmp_idx'),
   'markup_3c_hmp_idx',
   VARIADIC ARRAY[col_html, col_md, col_plain])
 FROM markup_3c_hmp WHERE id = 1;
-                                                                                                                                                      bm25_highlights                                                                                                                                                      
+                                                                                                                                                       bm25_headline                                                                                                                                                       
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  {"col_md": {"matches": [{"end": 25, "term": "emphasi", "start": 17, "match_type": "exact", "matched_text": "emphasis"}], "snippet": "Heading with  <b>emphasis</b>", "positions": [[17, 25]]}, "col_html": {"matches": [], "snippet": "", "positions": []}, "col_plain": {"matches": [], "snippet": "", "positions": []}}
 (1 row)

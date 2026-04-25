@@ -1522,8 +1522,8 @@ find_bm25_scan_info(Plan *plan, BM25OidCache *oids, BM25ScanInfo *out)
 }
 
 /*
- * Rewrite bm25_highlights() zero-arg calls in a target list.
- * Replaces them with bm25_highlights(query, index_name, col1, col2, ...).
+ * Rewrite bm25_headline() zero-arg calls in a target list.
+ * Replaces them with bm25_headline(query, index_name, col1, col2, ...).
  */
 static void
 rewrite_highlights_in_targetlist(
@@ -1536,14 +1536,14 @@ rewrite_highlights_in_targetlist(
 	int		  i;
 
 	auto_funcoid = LookupFuncName(
-			list_make1(makeString("bm25_highlights")), 0, NULL, true);
+			list_make1(makeString("bm25_headline")), 0, NULL, true);
 	if (!OidIsValid(auto_funcoid))
 		return;
 
 	{
 		Oid argtypes[3] = {oids->tpquery_type_oid, TEXTOID, TEXTARRAYOID};
 		full_funcoid	= LookupFuncName(
-				   list_make1(makeString("bm25_highlights")), 3, argtypes, true);
+				   list_make1(makeString("bm25_headline")), 3, argtypes, true);
 	}
 	if (!OidIsValid(full_funcoid))
 		return;
@@ -1788,7 +1788,7 @@ rewrite_snippets_in_targetlist(
 										: "bm25_snippet_positions()"),
 						 errhint("Use bm25_snippet('field_name') for "
 								 "multi-column indexes, or "
-								 "bm25_highlights() for all fields.")));
+								 "bm25_headline() for all fields.")));
 			col_attnum = info->attkeys[0];
 		}
 

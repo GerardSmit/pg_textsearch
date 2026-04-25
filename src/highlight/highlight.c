@@ -90,8 +90,8 @@ PG_FUNCTION_INFO_V1(bm25_snippet);
 PG_FUNCTION_INFO_V1(bm25_snippet_text);
 PG_FUNCTION_INFO_V1(bm25_snippet_positions);
 PG_FUNCTION_INFO_V1(bm25_snippet_positions_text);
-PG_FUNCTION_INFO_V1(bm25_highlights);
-PG_FUNCTION_INFO_V1(bm25_highlights_auto);
+PG_FUNCTION_INFO_V1(bm25_headline);
+PG_FUNCTION_INFO_V1(bm25_headline_auto);
 PG_FUNCTION_INFO_V1(bm25_snippet_auto);
 PG_FUNCTION_INFO_V1(bm25_snippet_field);
 PG_FUNCTION_INFO_V1(bm25_snippet_positions_auto);
@@ -1213,7 +1213,7 @@ tp_hl_append_json_field(
 }
 
 Datum
-bm25_highlights(PG_FUNCTION_ARGS)
+bm25_headline(PG_FUNCTION_ARGS)
 {
 	TpQuery		   *query;
 	char		   *index_name;
@@ -1302,16 +1302,16 @@ bm25_highlights(PG_FUNCTION_ARGS)
 }
 
 /*
- * Zero-arg stub: the planner rewrites bm25_highlights() to inject
+ * Zero-arg stub: the planner rewrites bm25_headline() to inject
  * the query, index name, and column values from the active BM25 scan.
  * If the planner didn't rewrite (no active scan), error out.
  */
 Datum
-bm25_highlights_auto(PG_FUNCTION_ARGS pg_attribute_unused())
+bm25_headline_auto(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("bm25_highlights() requires an active bm25 "
+			 errmsg("bm25_headline() requires an active bm25 "
 					"index scan"),
 			 errhint("Use ORDER BY ... <@> to_bm25query(...) to "
 					 "enable an index scan, or pass arguments "

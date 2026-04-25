@@ -533,10 +533,10 @@ SELECT bm25_snippet(
 FROM markup_3c WHERE id = 1;
 
 -- ============================================================
--- 21. bm25_highlights JSON on normalized multi-column
+-- 21. bm25_headline JSON on normalized multi-column
 -- ============================================================
 
-SELECT bm25_highlights(
+SELECT bm25_headline(
   to_bm25query('emphasis', 'markup_3c_hmp_idx'),
   'markup_3c_hmp_idx',
   VARIADIC ARRAY[col_html, col_md, col_plain])

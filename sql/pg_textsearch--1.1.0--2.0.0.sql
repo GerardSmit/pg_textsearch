@@ -11,7 +11,7 @@
 --   * content_format reloption for HTML/Markdown normalization
 --   * record LHS operator '(a, b) <@> bm25query'
 --   * unified to_bm25query(text, index, grammar, fuzzy_max_distance)
---   * bm25_snippet / bm25_snippet_positions / bm25_highlights
+--   * bm25_snippet / bm25_snippet_positions / bm25_headline
 --   * bm25_prewarm for buffer cache warming
 
 -- Verify loaded library matches this SQL script version
@@ -167,12 +167,12 @@ RETURNS int4range[]
 AS 'MODULE_PATHNAME', 'bm25_snippet_positions_text'
 LANGUAGE C STABLE PARALLEL SAFE;
 
-CREATE FUNCTION @extschema@.bm25_highlights(
+CREATE FUNCTION @extschema@.bm25_headline(
     query @extschema@.bm25query,
     index_name text,
     VARIADIC fields text[])
 RETURNS jsonb
-AS 'MODULE_PATHNAME', 'bm25_highlights'
+AS 'MODULE_PATHNAME', 'bm25_headline'
 LANGUAGE C STABLE PARALLEL SAFE;
 
 -- Index prewarm helper.

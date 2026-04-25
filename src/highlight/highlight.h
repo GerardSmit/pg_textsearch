@@ -14,4 +14,4 @@ Datum bm25_snippet(PG_FUNCTION_ARGS);
 Datum bm25_snippet_text(PG_FUNCTION_ARGS);
 Datum bm25_snippet_positions(PG_FUNCTION_ARGS);
 Datum bm25_snippet_positions_text(PG_FUNCTION_ARGS);
-Datum bm25_highlights(PG_FUNCTION_ARGS);
+Datum bm25_headline(PG_FUNCTION_ARGS);

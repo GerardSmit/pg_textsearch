@@ -131,33 +131,33 @@ FROM highlight_docs WHERE id = 1;
 (1 row)
 
 -- JSON helper returns one object keyed by index field names.
-SELECT bm25_highlights(
+SELECT bm25_headline(
   to_bm25query('title:hello body:brav*', 'highlight_docs_idx', grammar => true),
   'highlight_docs_idx',
   VARIADIC ARRAY[title, body])
 FROM highlight_docs WHERE id = 1;
-                                                                                                                                                                      bm25_highlights                                                                                                                                                                      
+                                                                                                                                                                       bm25_headline                                                                                                                                                                       
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  {"body": {"matches": [{"end": 11, "term": "brav", "start": 6, "match_type": "prefix", "matched_text": "brave"}], "snippet": "Hello <b>brave</b> world", "positions": [[6, 11]]}, "title": {"matches": [{"end": 5, "term": "hello", "start": 0, "match_type": "exact", "matched_text": "Hello"}], "snippet": "<b>Hello</b> world", "positions": [[0, 5]]}}
 (1 row)
 
 -- NULL fields produce empty JSON entries.
-SELECT bm25_highlights(
+SELECT bm25_headline(
   to_bm25query('hello', 'highlight_docs_idx'),
   'highlight_docs_idx',
   VARIADIC ARRAY[title, body])
 FROM highlight_docs WHERE id = 3;
-                                                    bm25_highlights                                                    
+                                                     bm25_headline                                                     
 -----------------------------------------------------------------------------------------------------------------------
  {"body": {"matches": [], "snippet": null, "positions": []}, "title": {"matches": [], "snippet": "", "positions": []}}
 (1 row)
 
--- Zero-arg bm25_highlights(): query, index, columns inferred from scan.
-SELECT bm25_highlights()
+-- Zero-arg bm25_headline(): query, index, columns inferred from scan.
+SELECT bm25_headline()
 FROM highlight_docs
 ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
 LIMIT 2;
-                                                                                                                                                                     bm25_highlights                                                                                                                                                                     
+                                                                                                                                                                      bm25_headline                                                                                                                                                                      
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  {"body": {"matches": [{"end": 5, "term": "hello", "start": 0, "match_type": "exact", "matched_text": "Hello"}], "snippet": "<b>Hello</b> brave world", "positions": [[0, 5]]}, "title": {"matches": [{"end": 5, "term": "hello", "start": 0, "match_type": "exact", "matched_text": "Hello"}], "snippet": "<b>Hello</b> world", "positions": [[0, 5]]}}
  {"body": {"matches": [], "snippet": "", "positions": []}, "title": {"matches": [{"end": 5, "term": "hello", "start": 0, "match_type": "exact", "matched_text": "Hello"}, {"end": 11, "term": "hello", "start": 6, "match_type": "exact", "matched_text": "hello"}], "snippet": "<b>Hello</b> <b>hello</b>", "positions": [[0, 5], [6, 11]]}}
