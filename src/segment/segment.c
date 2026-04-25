@@ -39,6 +39,7 @@
 #include "segment/io.h"
 #include "segment/pagemapper.h"
 #include "segment/segment.h"
+#include "types/fuzzy.h"
 
 /* External: compression GUC from mod.c */
 extern bool tp_compress_segments;
@@ -50,10 +51,6 @@ extern bool tp_compress_segments;
  * same backend, the performance impact of removing the cache is minimal.
  */
 
-/*
- * Version-aware dictionary entry reader.
- * V3 segments have 12-byte TpDictEntryV3; V4 have 16-byte TpDictEntry.
- */
 void
 tp_segment_read_dict_entry(
 		TpSegmentReader *reader,
@@ -61,27 +58,12 @@ tp_segment_read_dict_entry(
 		uint32			 index,
 		TpDictEntry		*entry)
 {
-	uint64 entry_offset;
+	uint64 entry_offset = header->entries_offset +
+						  (uint64)index * sizeof(TpDictEntry);
 
-	if (reader->segment_version <= TP_SEGMENT_FORMAT_VERSION_3)
-	{
-		TpDictEntryV3 v3;
-
-		entry_offset = header->entries_offset +
-					   (uint64)index * sizeof(TpDictEntryV3);
-		tp_segment_read(reader, entry_offset, &v3, sizeof(TpDictEntryV3));
-
-		/* Widen V3 fields to V4 */
-		entry->skip_index_offset = (uint64)v3.skip_index_offset;
-		entry->block_count		 = v3.block_count;
-		entry->doc_freq			 = v3.doc_freq;
-	}
-	else
-	{
-		entry_offset = header->entries_offset +
-					   (uint64)index * sizeof(TpDictEntry);
-		tp_segment_read(reader, entry_offset, entry, sizeof(TpDictEntry));
-	}
+	(void)reader; /* segment_version no longer dispatches; current format only
+				   */
+	tp_segment_read(reader, entry_offset, entry, sizeof(TpDictEntry));
 }
 
 /*
@@ -127,10 +109,6 @@ tp_segment_open_ex(Relation index, BlockNumber root_block, bool load_ctids)
 	LockBuffer(header_buf, BUFFER_LOCK_SHARE);
 	header_page = BufferGetPage(header_buf);
 
-	/*
-	 * Read raw magic and version first to determine format, then
-	 * read the correct header struct and widen to V4 if needed.
-	 */
 	{
 		uint32 raw_magic;
 		uint32 raw_version;
@@ -140,7 +118,6 @@ tp_segment_open_ex(Relation index, BlockNumber root_block, bool load_ctids)
 			   (char *)PageGetContents(header_page) + sizeof(uint32),
 			   sizeof(uint32));
 
-		/* Validate magic before version dispatch */
 		if (raw_magic != TP_SEGMENT_MAGIC)
 		{
 			UnlockReleaseBuffer(header_buf);
@@ -154,97 +131,25 @@ tp_segment_open_ex(Relation index, BlockNumber root_block, bool load_ctids)
 							 TP_SEGMENT_MAGIC)));
 		}
 
-		reader->segment_version = raw_version;
-		reader->header			= palloc(sizeof(TpSegmentHeader));
-
-		if (raw_version <= TP_SEGMENT_FORMAT_VERSION_3)
-		{
-			/* V3: read legacy struct and widen to V4 */
-			TpSegmentHeaderV3 v3;
-
-			memcpy(&v3,
-				   PageGetContents(header_page),
-				   sizeof(TpSegmentHeaderV3));
-
-			header						= reader->header;
-			header->magic				= v3.magic;
-			header->version				= v3.version;
-			header->created_at			= v3.created_at;
-			header->num_pages			= v3.num_pages;
-			header->data_size			= (uint64)v3.data_size;
-			header->level				= v3.level;
-			header->next_segment		= v3.next_segment;
-			header->dictionary_offset	= (uint64)v3.dictionary_offset;
-			header->strings_offset		= (uint64)v3.strings_offset;
-			header->entries_offset		= (uint64)v3.entries_offset;
-			header->postings_offset		= (uint64)v3.postings_offset;
-			header->skip_index_offset	= (uint64)v3.skip_index_offset;
-			header->fieldnorm_offset	= (uint64)v3.fieldnorm_offset;
-			header->ctid_pages_offset	= (uint64)v3.ctid_pages_offset;
-			header->ctid_offsets_offset = (uint64)v3.ctid_offsets_offset;
-			header->num_terms			= v3.num_terms;
-			header->num_docs			= v3.num_docs;
-			header->total_tokens		= v3.total_tokens;
-			header->page_index			= v3.page_index;
-
-			/* V3 has no alive bitset */
-			header->alive_bitset_offset = 0;
-			header->alive_count			= header->num_docs;
-		}
-		else if (raw_version <= TP_SEGMENT_FORMAT_VERSION_4)
-		{
-			/* V4: read legacy struct and widen to V5 */
-			TpSegmentHeaderV4 v4;
-
-			memcpy(&v4,
-				   PageGetContents(header_page),
-				   sizeof(TpSegmentHeaderV4));
-
-			header						= reader->header;
-			header->magic				= v4.magic;
-			header->version				= v4.version;
-			header->created_at			= v4.created_at;
-			header->num_pages			= v4.num_pages;
-			header->data_size			= v4.data_size;
-			header->level				= v4.level;
-			header->next_segment		= v4.next_segment;
-			header->dictionary_offset	= v4.dictionary_offset;
-			header->strings_offset		= v4.strings_offset;
-			header->entries_offset		= v4.entries_offset;
-			header->postings_offset		= v4.postings_offset;
-			header->skip_index_offset	= v4.skip_index_offset;
-			header->fieldnorm_offset	= v4.fieldnorm_offset;
-			header->ctid_pages_offset	= v4.ctid_pages_offset;
-			header->ctid_offsets_offset = v4.ctid_offsets_offset;
-			header->num_terms			= v4.num_terms;
-			header->num_docs			= v4.num_docs;
-			header->total_tokens		= v4.total_tokens;
-			header->page_index			= v4.page_index;
-
-			/* V4 has no alive bitset */
-			header->alive_bitset_offset = 0;
-			header->alive_count			= header->num_docs;
-		}
-		else if (raw_version <= TP_SEGMENT_FORMAT_VERSION)
-		{
-			/* V5+: full header */
-			memcpy(reader->header,
-				   PageGetContents(header_page),
-				   sizeof(TpSegmentHeader));
-			header = reader->header;
-		}
-		else
+		if (raw_version != TP_SEGMENT_FORMAT_VERSION)
 		{
 			UnlockReleaseBuffer(header_buf);
-			pfree(reader->header);
 			pfree(reader);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("unsupported segment format version %u "
 							"at block %u",
 							raw_version,
-							root_block)));
+							root_block),
+					 errhint("Pre-2.0 segments are not readable; REINDEX.")));
 		}
+
+		reader->segment_version = raw_version;
+		reader->header			= palloc(sizeof(TpSegmentHeader));
+		memcpy(reader->header,
+			   PageGetContents(header_page),
+			   sizeof(TpSegmentHeader));
+		header = reader->header;
 	}
 
 	reader->num_pages = header->num_pages;
@@ -534,6 +439,32 @@ tp_segment_close(TpSegmentReader *reader)
 		pfree(reader->cached_ctid_offsets);
 
 	pfree(reader);
+}
+
+void
+tp_segment_prefetch(TpSegmentReader *reader, uint64 logical_offset, uint32 len)
+{
+	uint32 lp_start;
+	uint32 lp_end;
+	uint32 lp;
+
+	if (reader == NULL || len == 0)
+		return;
+	/* BufFile path: not backed by shared_buffers, skip. */
+	if (reader->buffile != NULL)
+		return;
+	if (reader->page_map == NULL || reader->num_pages == 0)
+		return;
+
+	lp_start = (uint32)(logical_offset / SEGMENT_DATA_PER_PAGE);
+	lp_end	 = (uint32)((logical_offset + len - 1) / SEGMENT_DATA_PER_PAGE);
+
+	for (lp = lp_start; lp <= lp_end && lp < reader->num_pages; lp++)
+	{
+		BlockNumber physical = reader->page_map[lp];
+		if (physical < reader->nblocks)
+			(void)PrefetchBuffer(reader->index, MAIN_FORKNUM, physical);
+	}
 }
 
 void
@@ -910,9 +841,15 @@ write_page_index(Relation index, BlockNumber *pages, uint32 num_pages)
 /*
  * Build docmap from memtable's document lengths.
  * Returns the docmap builder which must be freed by caller.
+ *
+ * Phase 6.1d: when this is a multi-col index (metap->num_fields > 1),
+ * configure the docmap to allocate per-field fieldnorms at finalize,
+ * and populate per-field lengths from the multi-col doc_field_lengths
+ * dshash if present.  Single-col indexes go through tp_docmap_add()
+ * which leaves field_lengths[] zeroed and field_fieldnorms NULL.
  */
 static TpDocMapBuilder *
-build_docmap_from_memtable(TpLocalIndexState *state)
+build_docmap_from_memtable(TpLocalIndexState *state, Relation index)
 {
 	TpMemtable		 *memtable = get_memtable(state);
 	TpDocMapBuilder	 *docmap;
@@ -920,11 +857,25 @@ build_docmap_from_memtable(TpLocalIndexState *state)
 	dshash_seq_status seq_status;
 	TpDocLengthEntry *doc_entry;
 	dshash_parameters doc_lengths_params;
+	int				  num_fields = 0;
 
 	docmap = tp_docmap_create();
 
+	/* Read num_fields from metapage */
+	if (index != NULL)
+	{
+		TpIndexMetaPage mp = tp_get_metapage(index);
+		num_fields		   = mp->num_fields;
+		pfree(mp);
+	}
+	if (num_fields > 1)
+		tp_docmap_set_num_fields(docmap, num_fields);
+
 	if (!memtable || memtable->doc_lengths_handle == DSHASH_HANDLE_INVALID)
+	{
+		tp_docmap_finalize(docmap);
 		return docmap;
+	}
 
 	/* Setup parameters for doc lengths hash table */
 	memset(&doc_lengths_params, 0, sizeof(doc_lengths_params));
@@ -933,21 +884,70 @@ build_docmap_from_memtable(TpLocalIndexState *state)
 	doc_lengths_params.hash_function	= dshash_memhash;
 	doc_lengths_params.compare_function = dshash_memcmp;
 
-	/* Attach to document lengths hash table */
 	doc_lengths_hash = dshash_attach(
 			state->dsa,
 			&doc_lengths_params,
 			memtable->doc_lengths_handle,
 			NULL);
 
-	/* Iterate through all documents and add to docmap */
-	dshash_seq_init(&seq_status, doc_lengths_hash, false);
-	while ((doc_entry = (TpDocLengthEntry *)dshash_seq_next(&seq_status)) !=
-		   NULL)
+	/*
+	 * For multi-col, also attach the per-field length table.  Walk the
+	 * doc_lengths table and look up each ctid in the per-field table.
+	 * Multi-col INSERTs write both tables in tp_add_document_terms;
+	 * any doc with no per-field entry is treated as having all length
+	 * in field 0 (defensive — shouldn't happen in practice).
+	 */
+	if (num_fields > 1 &&
+		memtable->doc_field_lengths_handle != DSHASH_HANDLE_INVALID)
 	{
-		tp_docmap_add(docmap, &doc_entry->ctid, (uint32)doc_entry->doc_length);
+		dshash_table *fl_hash = tp_doc_field_length_table_attach(
+				state->dsa, memtable->doc_field_lengths_handle);
+
+		dshash_seq_init(&seq_status, doc_lengths_hash, false);
+		while ((doc_entry = (TpDocLengthEntry *)dshash_seq_next(
+						&seq_status)) != NULL)
+		{
+			TpDocFieldLengthEntry *fl_entry;
+			uint32				   field_lens[TP_MAX_FIELDS];
+			int					   f;
+
+			memset(field_lens, 0, sizeof(field_lens));
+			fl_entry = (TpDocFieldLengthEntry *)
+					dshash_find(fl_hash, &doc_entry->ctid, false);
+			if (fl_entry != NULL)
+			{
+				for (f = 0; f < TP_MAX_FIELDS; f++)
+					field_lens[f] = (uint32)fl_entry->field_lengths[f];
+				dshash_release_lock(fl_hash, fl_entry);
+			}
+			else
+			{
+				/* defensive fallback: dump everything into field 0 */
+				field_lens[0] = (uint32)doc_entry->doc_length;
+			}
+
+			tp_docmap_add_multi(
+					docmap,
+					&doc_entry->ctid,
+					(uint32)doc_entry->doc_length,
+					field_lens,
+					num_fields);
+		}
+		dshash_seq_term(&seq_status);
+		dshash_detach(fl_hash);
 	}
-	dshash_seq_term(&seq_status);
+	else
+	{
+		dshash_seq_init(&seq_status, doc_lengths_hash, false);
+		while ((doc_entry = (TpDocLengthEntry *)dshash_seq_next(
+						&seq_status)) != NULL)
+		{
+			tp_docmap_add(
+					docmap, &doc_entry->ctid, (uint32)doc_entry->doc_length);
+		}
+		dshash_seq_term(&seq_status);
+	}
+
 	dshash_detach(doc_lengths_hash);
 
 	/* Finalize to build output arrays */
@@ -1005,7 +1005,7 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	memset(&writer, 0, sizeof(TpSegmentWriter));
 
 	/* Build docmap from memtable */
-	docmap = build_docmap_from_memtable(state);
+	docmap = build_docmap_from_memtable(state, index);
 
 	/* Build sorted dictionary */
 	terms = tp_build_dictionary(state, &num_terms);
@@ -1149,10 +1149,24 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 		num_blocks = (doc_count + TP_BLOCK_SIZE - 1) / TP_BLOCK_SIZE;
 		term_blocks[i].block_count = num_blocks;
 
-		/* Convert postings to block format */
+		/*
+		 * Convert postings to block format.  Phase 6.1d: extract the
+		 * field tag from terms[i].term[0]; for tagged terms (multi-col)
+		 * pull the per-field fieldnorm so BMW reads BM25F-normalized
+		 * lengths inline.  Untagged terms fall through to the total
+		 * fieldnorm.
+		 */
 		block_postings = palloc(doc_count * sizeof(TpBlockPosting));
 		{
-			uint32 j;
+			uint32		  j;
+			int			  term_field_idx = -1;
+			unsigned char term_first_byte =
+					(terms[i].term_len > 0) ? (unsigned char)terms[i].term[0]
+											: 0;
+
+			if (term_first_byte >= TP_FIELD_TAG_BASE)
+				term_field_idx = term_first_byte - TP_FIELD_TAG_BASE;
+
 			for (j = 0; j < doc_count; j++)
 			{
 				uint32 doc_id = tp_docmap_lookup(docmap, &entries[j].ctid);
@@ -1164,7 +1178,11 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 						 ItemPointerGetBlockNumber(&entries[j].ctid),
 						 ItemPointerGetOffsetNumber(&entries[j].ctid));
 
-				norm = tp_docmap_get_fieldnorm(docmap, doc_id);
+				if (term_field_idx >= 0)
+					norm = tp_docmap_get_field_fieldnorm(
+							docmap, doc_id, term_field_idx);
+				else
+					norm = tp_docmap_get_fieldnorm(docmap, doc_id);
 
 				block_postings[j].doc_id	= doc_id;
 				block_postings[j].frequency = (uint16)entries[j].frequency;
@@ -1299,6 +1317,166 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	/* Update num_docs and total_tokens to per-segment values */
 	header.num_docs		= docmap->num_docs;
 	header.total_tokens = docmap->total_tokens;
+
+	/*
+	 * V6 positions section (optional).
+	 *
+	 * Layout: TpPositionsIndexEntry[num_terms] array, then a flat
+	 * uint32 stream of concatenated positions for each term's postings
+	 * in iteration order. A reader walks the posting iterator and, at
+	 * each posting, slices the next `frequency` uint32s off the stream.
+	 *
+	 * If NO posting entries carry positions (InvalidDsaPointer), we
+	 * skip the section entirely — positions_offset stays 0, the reader
+	 * treats the segment as "no positions" and phrase queries fall
+	 * back to heap re-fetch.
+	 */
+	{
+		bool   any_positions = false;
+		uint32 term_idx;
+
+		/* First pass: detect whether any term has positions at all */
+		for (term_idx = 0; term_idx < num_terms && !any_positions; term_idx++)
+		{
+			TpPostingList  *pl;
+			TpPostingEntry *pe;
+			uint32			j;
+
+			if (terms[term_idx].posting_list_dp == InvalidDsaPointer)
+				continue;
+			pl = (TpPostingList *)dsa_get_address(
+					state->dsa, terms[term_idx].posting_list_dp);
+			if (pl == NULL || pl->doc_count == 0 ||
+				pl->entries_dp == InvalidDsaPointer)
+				continue;
+			pe = (TpPostingEntry *)dsa_get_address(state->dsa, pl->entries_dp);
+			for (j = 0; j < (uint32)pl->doc_count; j++)
+			{
+				if (DsaPointerIsValid(pe[j].positions_dp))
+				{
+					any_positions = true;
+					break;
+				}
+			}
+		}
+
+		if (any_positions)
+		{
+			TpPositionsIndexEntry *pos_index;
+			uint8				 **per_term_buf;
+			uint32				  *per_term_len;
+			uint64				   data_rel_off = 0;
+			uint64				   positions_section_start;
+
+			header.positions_offset = writer.current_offset;
+			positions_section_start = writer.current_offset;
+
+			pos_index	 = palloc0(num_terms * sizeof(TpPositionsIndexEntry));
+			per_term_buf = palloc0(num_terms * sizeof(uint8 *));
+			per_term_len = palloc0(num_terms * sizeof(uint32));
+
+			/*
+			 * Pass 1: encode each term's positions as varint-delta
+			 * into a per-term buffer. We need final sizes before
+			 * writing the positions index, so buffer-then-flush.
+			 */
+			for (term_idx = 0; term_idx < num_terms; term_idx++)
+			{
+				TpPostingList  *pl;
+				TpPostingEntry *pe;
+				uint32			max_bytes = 0;
+				uint32			enc_bytes = 0;
+				uint8		   *buf		  = NULL;
+				uint32			j;
+
+				if (terms[term_idx].posting_list_dp == InvalidDsaPointer)
+					goto pos_term_done;
+				pl = (TpPostingList *)dsa_get_address(
+						state->dsa, terms[term_idx].posting_list_dp);
+				if (pl == NULL || pl->doc_count == 0 ||
+					pl->entries_dp == InvalidDsaPointer)
+					goto pos_term_done;
+				pe = (TpPostingEntry *)
+						dsa_get_address(state->dsa, pl->entries_dp);
+
+				/* Worst-case size: 5 bytes per uint32 across all postings */
+				for (j = 0; j < (uint32)pl->doc_count; j++)
+				{
+					if (DsaPointerIsValid(pe[j].positions_dp))
+						max_bytes += tp_positions_max_encoded_bytes(
+								(uint32)pe[j].frequency);
+				}
+				if (max_bytes == 0)
+					goto pos_term_done;
+
+				buf = palloc(max_bytes);
+				for (j = 0; j < (uint32)pl->doc_count; j++)
+				{
+					uint32 *pos_data;
+					uint32	freq;
+
+					if (!DsaPointerIsValid(pe[j].positions_dp) ||
+						pe[j].frequency == 0)
+						continue;
+					pos_data = (uint32 *)
+							dsa_get_address(state->dsa, pe[j].positions_dp);
+					freq = (uint32)pe[j].frequency;
+					enc_bytes += tp_positions_encode_varint_delta(
+							pos_data, freq, buf + enc_bytes);
+				}
+
+			pos_term_done:
+				per_term_buf[term_idx]					  = buf;
+				per_term_len[term_idx]					  = enc_bytes;
+				pos_index[term_idx].positions_byte_offset = data_rel_off;
+				pos_index[term_idx].positions_byte_length =
+						tp_pos_encode_length(enc_bytes, /*varint=*/true);
+				data_rel_off += enc_bytes;
+			}
+
+			/* Emit positions index */
+			tp_segment_writer_write(
+					&writer,
+					pos_index,
+					num_terms * sizeof(TpPositionsIndexEntry));
+			pfree(pos_index);
+
+			/* Emit per-term varint data */
+			for (term_idx = 0; term_idx < num_terms; term_idx++)
+			{
+				if (per_term_buf[term_idx] != NULL &&
+					per_term_len[term_idx] > 0)
+				{
+					tp_segment_writer_write(
+							&writer,
+							per_term_buf[term_idx],
+							per_term_len[term_idx]);
+					pfree(per_term_buf[term_idx]);
+				}
+			}
+			pfree(per_term_buf);
+			pfree(per_term_len);
+
+			header.positions_size = writer.current_offset -
+									positions_section_start;
+		}
+	}
+
+	header.fuzzy_index_offset = writer.current_offset;
+	{
+		TpFuzzyTermMeta *fuzzy_meta;
+		uint32			 term_idx;
+
+		fuzzy_meta = palloc(num_terms * sizeof(TpFuzzyTermMeta));
+		for (term_idx = 0; term_idx < num_terms; term_idx++)
+			tp_fuzzy_fill_term_meta(
+					terms[term_idx].term, &fuzzy_meta[term_idx]);
+		tp_segment_writer_write(
+				&writer, fuzzy_meta, num_terms * sizeof(TpFuzzyTermMeta));
+		pfree(fuzzy_meta);
+		header.fuzzy_index_size = writer.current_offset -
+								  header.fuzzy_index_offset;
+	}
 
 	/* Write page index */
 	tp_segment_writer_flush(&writer);
@@ -1454,6 +1632,8 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	existing_header->total_tokens		 = header.total_tokens;
 	existing_header->data_size			 = header.data_size;
 	existing_header->num_pages			 = header.num_pages;
+	existing_header->positions_offset	 = header.positions_offset;
+	existing_header->positions_size		 = header.positions_size;
 	existing_header->page_index			 = header.page_index;
 
 	/* Ensure pd_lower covers content for GenericXLog */
@@ -1500,6 +1680,44 @@ tp_write_segment(TpLocalIndexState *state, Relation index)
 	}
 
 	FlushRelationBuffers(index);
+
+	/*
+	 * Phase 6.1d: roll the docmap's per-field token sums into the
+	 * metapage so query-time scoring can compute per-field avgdl from
+	 * persisted state.  Done before clearing the memtable (callers
+	 * call tp_clear_memtable AFTER this function returns).
+	 */
+	{
+		bool any = false;
+		int	 f;
+
+		for (f = 0; f < TP_MAX_FIELDS; f++)
+		{
+			if (docmap->total_tokens_per_field[f] > 0)
+			{
+				any = true;
+				break;
+			}
+		}
+
+		if (any)
+		{
+			Buffer			  m_buf = ReadBuffer(index, TP_METAPAGE_BLKNO);
+			GenericXLogState *xlog;
+			Page			  m_page;
+			TpIndexMetaPage	  mp;
+
+			LockBuffer(m_buf, BUFFER_LOCK_EXCLUSIVE);
+			xlog   = GenericXLogStart(index);
+			m_page = GenericXLogRegisterBuffer(xlog, m_buf, 0);
+			mp	   = (TpIndexMetaPage)PageGetContents(m_page);
+			for (f = 0; f < TP_MAX_FIELDS; f++)
+				mp->total_len_per_field[f] +=
+						docmap->total_tokens_per_field[f];
+			GenericXLogFinish(xlog);
+			UnlockReleaseBuffer(m_buf);
+		}
+	}
 
 	/* Clean up */
 	tp_free_dictionary(terms, num_terms);
@@ -1637,79 +1855,7 @@ tp_dump_segment_to_output(
 	LockBuffer(header_buf, BUFFER_LOCK_SHARE);
 	header_page = BufferGetPage(header_buf);
 
-	/* Version-aware header read */
-	{
-		uint32 raw_version;
-		memcpy(&raw_version,
-			   (char *)PageGetContents(header_page) + sizeof(uint32),
-			   sizeof(uint32));
-
-		if (raw_version <= TP_SEGMENT_FORMAT_VERSION_3)
-		{
-			TpSegmentHeaderV3 v3;
-			memcpy(&v3,
-				   PageGetContents(header_page),
-				   sizeof(TpSegmentHeaderV3));
-
-			header.magic			   = v3.magic;
-			header.version			   = v3.version;
-			header.created_at		   = v3.created_at;
-			header.num_pages		   = v3.num_pages;
-			header.data_size		   = (uint64)v3.data_size;
-			header.level			   = v3.level;
-			header.next_segment		   = v3.next_segment;
-			header.dictionary_offset   = (uint64)v3.dictionary_offset;
-			header.strings_offset	   = (uint64)v3.strings_offset;
-			header.entries_offset	   = (uint64)v3.entries_offset;
-			header.postings_offset	   = (uint64)v3.postings_offset;
-			header.skip_index_offset   = (uint64)v3.skip_index_offset;
-			header.fieldnorm_offset	   = (uint64)v3.fieldnorm_offset;
-			header.ctid_pages_offset   = (uint64)v3.ctid_pages_offset;
-			header.ctid_offsets_offset = (uint64)v3.ctid_offsets_offset;
-			header.alive_bitset_offset = 0;
-			header.alive_count		   = v3.num_docs;
-			header.num_terms		   = v3.num_terms;
-			header.num_docs			   = v3.num_docs;
-			header.total_tokens		   = v3.total_tokens;
-			header.page_index		   = v3.page_index;
-		}
-		else if (raw_version <= TP_SEGMENT_FORMAT_VERSION_4)
-		{
-			TpSegmentHeaderV4 v4;
-
-			memcpy(&v4,
-				   PageGetContents(header_page),
-				   sizeof(TpSegmentHeaderV4));
-
-			header.magic			   = v4.magic;
-			header.version			   = v4.version;
-			header.created_at		   = v4.created_at;
-			header.num_pages		   = v4.num_pages;
-			header.data_size		   = v4.data_size;
-			header.level			   = v4.level;
-			header.next_segment		   = v4.next_segment;
-			header.dictionary_offset   = v4.dictionary_offset;
-			header.strings_offset	   = v4.strings_offset;
-			header.entries_offset	   = v4.entries_offset;
-			header.postings_offset	   = v4.postings_offset;
-			header.skip_index_offset   = v4.skip_index_offset;
-			header.fieldnorm_offset	   = v4.fieldnorm_offset;
-			header.ctid_pages_offset   = v4.ctid_pages_offset;
-			header.ctid_offsets_offset = v4.ctid_offsets_offset;
-			header.alive_bitset_offset = 0;
-			header.alive_count		   = v4.num_docs;
-			header.num_terms		   = v4.num_terms;
-			header.num_docs			   = v4.num_docs;
-			header.total_tokens		   = v4.total_tokens;
-			header.page_index		   = v4.page_index;
-		}
-		else
-		{
-			memcpy(&header,
-				   PageGetContents(header_page),
-				   sizeof(TpSegmentHeader));
-		}
-	}
+	memcpy(&header, PageGetContents(header_page), sizeof(TpSegmentHeader));
 
 	/* Hex dump in full mode (file output) */
 	if (out->full_dump)

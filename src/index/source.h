@@ -52,6 +52,15 @@ typedef struct TpDataSourceOps
 	int32 (*get_doc_length)(TpDataSource *source, ItemPointer ctid);
 
 	/*
+	 * Phase 6.1d: per-field doc length lookup.  field_idx < 0 returns
+	 * total doc_length (same as get_doc_length).  Multi-col indexes
+	 * implement this; single-col implementations may set it NULL —
+	 * the macro below falls back to get_doc_length.
+	 */
+	int32 (*get_doc_field_length)(
+			TpDataSource *source, ItemPointer ctid, int field_idx);
+
+	/*
 	 * Close and free the data source.
 	 */
 	void (*close)(TpDataSource *source);
@@ -73,6 +82,10 @@ struct TpDataSource
 	((src)->ops->free_postings((src), (data)))
 #define tp_source_get_doc_length(src, ctid) \
 	((src)->ops->get_doc_length((src), (ctid)))
+#define tp_source_get_doc_field_length(src, ctid, fidx)                \
+	((src)->ops->get_doc_field_length                                  \
+			 ? (src)->ops->get_doc_field_length((src), (ctid), (fidx)) \
+			 : (src)->ops->get_doc_length((src), (ctid)))
 #define tp_source_close(src) ((src)->ops->close((src)))
 
 /*

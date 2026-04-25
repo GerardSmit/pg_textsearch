@@ -97,6 +97,19 @@ extern void tp_segment_read(
 		uint64			 logical_offset,
 		void			*dest,
 		uint32			 len);
+
+/*
+ * Async prefetch the physical pages covering a logical byte range.
+ * Issues PrefetchBuffer calls so subsequent tp_segment_read on the
+ * same range is more likely to hit shared_buffers with the page
+ * already in flight. No-op for BufFile-backed readers (temp files
+ * don't pass through the buffer manager).
+ *
+ * len=0 or buffile-backed → silent no-op. effective_io_concurrency
+ * controls how many prefetches Postgres batches in flight.
+ */
+extern void tp_segment_prefetch(
+		TpSegmentReader *reader, uint64 logical_offset, uint32 len);
 extern void tp_segment_close(TpSegmentReader *reader);
 
 /* Lazy CTID lookup for deferred resolution */

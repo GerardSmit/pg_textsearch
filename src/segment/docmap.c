@@ -61,22 +61,47 @@ tp_docmap_create(void)
 			&hash_ctl,
 			HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
-	builder->num_docs	  = 0;
-	builder->capacity	  = 0;
-	builder->finalized	  = false;
-	builder->ctid_pages	  = NULL;
-	builder->ctid_offsets = NULL;
-	builder->fieldnorms	  = NULL;
-	builder->total_tokens = 0;
+	builder->num_docs		  = 0;
+	builder->capacity		  = 0;
+	builder->finalized		  = false;
+	builder->ctid_pages		  = NULL;
+	builder->ctid_offsets	  = NULL;
+	builder->fieldnorms		  = NULL;
+	builder->field_fieldnorms = NULL;
+	builder->num_fields		  = 0;
+	builder->total_tokens	  = 0;
+	memset(builder->total_tokens_per_field,
+		   0,
+		   sizeof(builder->total_tokens_per_field));
 
 	return builder;
+}
+
+void
+tp_docmap_set_num_fields(TpDocMapBuilder *builder, int num_fields)
+{
+	Assert(!builder->finalized);
+	if (num_fields > 1)
+		builder->num_fields = num_fields;
 }
 
 uint32
 tp_docmap_add(TpDocMapBuilder *builder, ItemPointer ctid, uint32 doc_length)
 {
+	return tp_docmap_add_multi(builder, ctid, doc_length, NULL, 0);
+}
+
+uint32
+tp_docmap_add_multi(
+		TpDocMapBuilder *builder,
+		ItemPointer		 ctid,
+		uint32			 doc_length,
+		const uint32	*field_lengths,
+		int				 num_fields)
+{
 	TpDocMapEntry *entry;
 	bool		   found;
+	int			   f;
 
 	Assert(!builder->finalized);
 
@@ -100,6 +125,19 @@ tp_docmap_add(TpDocMapBuilder *builder, ItemPointer ctid, uint32 doc_length)
 	/* New document - assign next sequential ID */
 	entry->doc_id	  = builder->num_docs;
 	entry->doc_length = doc_length;
+
+	memset(entry->field_lengths, 0, sizeof(entry->field_lengths));
+	if (field_lengths != NULL && num_fields > 0)
+	{
+		int n = num_fields < TP_MAX_FIELDS ? num_fields : TP_MAX_FIELDS;
+		for (f = 0; f < n; f++)
+		{
+			entry->field_lengths[f] = field_lengths[f];
+			if (field_lengths[f] > 0)
+				builder->total_tokens_per_field[f] += (uint64)field_lengths[f];
+		}
+	}
+
 	builder->num_docs++;
 	builder->total_tokens += doc_length;
 
@@ -187,6 +225,17 @@ tp_docmap_finalize(TpDocMapBuilder *builder)
 	builder->fieldnorms	  = palloc(sizeof(uint8) * builder->num_docs);
 
 	/*
+	 * Phase 6.1d: per-field encoded fieldnorms.  Allocated only when
+	 * tp_docmap_set_num_fields() was called with > 1; merge-built
+	 * docmaps and single-col spills leave this NULL and the accessor
+	 * falls back to the per-doc total.
+	 */
+	if (builder->num_fields > 1)
+		builder->field_fieldnorms = palloc(
+				(size_t)builder->num_docs * (size_t)builder->num_fields *
+				sizeof(uint8));
+
+	/*
 	 * Fill arrays and reassign doc_ids in CTID order.
 	 * Update hash table entries so lookups return the correct new doc_id.
 	 */
@@ -199,6 +248,15 @@ tp_docmap_finalize(TpDocMapBuilder *builder)
 		builder->ctid_offsets[i] = ItemPointerGetOffsetNumber(
 				&entries[i].ctid);
 		builder->fieldnorms[i] = encode_fieldnorm(entries[i].doc_length);
+
+		if (builder->field_fieldnorms != NULL)
+		{
+			size_t base = (size_t)i * (size_t)builder->num_fields;
+			int	   f;
+			for (f = 0; f < builder->num_fields; f++)
+				builder->field_fieldnorms[base + f] = encode_fieldnorm(
+						entries[i].field_lengths[f]);
+		}
 
 		/* Update hash table entry with new doc_id */
 		hash_entry = (TpDocMapEntry *)hash_search(
@@ -228,6 +286,9 @@ tp_docmap_destroy(TpDocMapBuilder *builder)
 
 	if (builder->fieldnorms)
 		pfree(builder->fieldnorms);
+
+	if (builder->field_fieldnorms)
+		pfree(builder->field_fieldnorms);
 
 	pfree(builder);
 }

@@ -92,6 +92,9 @@ typedef struct TpParallelBuildShared
 	/* Progress reporting */
 	pg_atomic_uint64 tuples_done;
 
+	/* Per-field content format (plain/html/markdown) */
+	uint8 field_formats[TP_MAX_FIELDS];
+
 	/*
 	 * Per-worker results (variable-length array follows).
 	 * Workers write their own slot; leader reads after Phase 1.
@@ -121,7 +124,8 @@ extern struct IndexBuildResult *tp_build_parallel(
 		double			  k1,
 		double			  b,
 		bool			  is_text_array,
-		int				  nworkers);
+		int				  nworkers,
+		const uint8		 *field_formats);
 
 /* Worker entry point (called by parallel infrastructure) */
 extern PGDLLEXPORT void

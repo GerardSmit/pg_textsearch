@@ -43,7 +43,7 @@ jobs:
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }}
+        sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} libxml2-dev pkg-config
         sudo systemctl stop postgresql
 
     - name: Build current version
@@ -234,7 +234,7 @@ jobs:
           -w /build \
           --user root \
           timescale/timescaledb-ha:pg${{ matrix.pg_version }}-all \
-          bash -c "apt-get update && apt-get install -y build-essential postgresql-server-dev-${{ matrix.pg_version }} && /build/build.sh '$VERSION' '${{ matrix.platform.type }}' '${{ matrix.pg_version }}'"
+          bash -c "apt-get update && apt-get install -y build-essential libxml2-dev pkg-config postgresql-server-dev-${{ matrix.pg_version }} && /build/build.sh '$VERSION' '${{ matrix.platform.type }}' '${{ matrix.pg_version }}'"
 
     - name: Verify package architecture
       run: |

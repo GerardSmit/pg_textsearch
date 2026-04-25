@@ -20,10 +20,11 @@
  */
 typedef struct TpMemtableSource
 {
-	TpDataSource	   base;			/* Must be first */
-	TpLocalIndexState *local_state;		/* Index state */
-	dshash_table	  *string_table;	/* Attached string table */
-	dshash_table	  *doclength_table; /* Attached doc length table */
+	TpDataSource	   base;			   /* Must be first */
+	TpLocalIndexState *local_state;		   /* Index state */
+	dshash_table	  *string_table;	   /* Attached string table */
+	dshash_table	  *doclength_table;	   /* Attached doc length table */
+	dshash_table	  *field_length_table; /* Multi-col only; NULL otherwise */
 } TpMemtableSource;
 
 /*
@@ -105,6 +106,36 @@ memtable_get_doc_length(TpDataSource *source, ItemPointer ctid)
 }
 
 /*
+ * Phase 6.1d: per-field doc length lookup.  Falls back to the total
+ * length when this index has no per-field table (single-col) or the
+ * doc isn't in the per-field table.
+ */
+static int32
+memtable_get_doc_field_length(
+		TpDataSource *source, ItemPointer ctid, int field_idx)
+{
+	TpMemtableSource *ms = (TpMemtableSource *)source;
+	int32			  v;
+
+	if (field_idx < 0 || ms->field_length_table == NULL)
+	{
+		if (!ms->doclength_table)
+			return -1;
+		return tp_get_document_length_attached(ms->doclength_table, ctid);
+	}
+
+	v = tp_get_document_field_length_attached(
+			ms->field_length_table, ctid, field_idx);
+	if (v >= 0)
+		return v;
+
+	/* Defensive fallback to total */
+	if (!ms->doclength_table)
+		return -1;
+	return tp_get_document_length_attached(ms->doclength_table, ctid);
+}
+
+/*
  * Close the memtable source and free resources.
  */
 static void
@@ -116,16 +147,19 @@ memtable_close(TpDataSource *source)
 		dshash_detach(ms->string_table);
 	if (ms->doclength_table)
 		dshash_detach(ms->doclength_table);
+	if (ms->field_length_table)
+		dshash_detach(ms->field_length_table);
 
 	pfree(ms);
 }
 
 /* Virtual function table for memtable source */
 static const TpDataSourceOps memtable_source_ops = {
-		.get_postings	= memtable_get_postings,
-		.free_postings	= memtable_free_postings,
-		.get_doc_length = memtable_get_doc_length,
-		.close			= memtable_close,
+		.get_postings		  = memtable_get_postings,
+		.free_postings		  = memtable_free_postings,
+		.get_doc_length		  = memtable_get_doc_length,
+		.get_doc_field_length = memtable_get_doc_field_length,
+		.close				  = memtable_close,
 };
 
 /*
@@ -161,6 +195,13 @@ tp_memtable_source_create(TpLocalIndexState *local_state)
 	{
 		ms->doclength_table = tp_doclength_table_attach(
 				local_state->dsa, memtable->doc_lengths_handle);
+	}
+
+	/* Phase 6.1d: attach the multi-col per-field length table if any. */
+	if (memtable->doc_field_lengths_handle != DSHASH_HANDLE_INVALID)
+	{
+		ms->field_length_table = tp_doc_field_length_table_attach(
+				local_state->dsa, memtable->doc_field_lengths_handle);
 	}
 
 	return (TpDataSource *)ms;

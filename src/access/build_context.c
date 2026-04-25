@@ -24,6 +24,7 @@
 #include "segment/io.h"
 #include "segment/pagemapper.h"
 #include "segment/segment.h"
+#include "types/fuzzy.h"
 
 /* Forward declarations for hash table support */
 static uint32 build_term_hash(const void *key, Size keysize);
@@ -65,11 +66,31 @@ tp_build_context_create(Size budget)
 	ctx->docs_capacity = TP_BUILD_INITIAL_DOCS;
 	ctx->fieldnorms	   = palloc(ctx->docs_capacity * sizeof(uint8));
 	ctx->ctids		   = palloc(ctx->docs_capacity * sizeof(ItemPointerData));
-	ctx->num_docs	   = 0;
-	ctx->total_len	   = 0;
-	ctx->budget		   = budget;
+	ctx->field_fieldnorms = NULL;
+	ctx->num_fields		  = 0;
+	ctx->num_docs		  = 0;
+	ctx->total_len		  = 0;
+	memset(ctx->total_len_per_field, 0, sizeof(ctx->total_len_per_field));
+	ctx->budget = budget;
 
 	return ctx;
+}
+
+/*
+ * Phase 6.1d: Enable per-field fieldnorm tracking for multi-col builds.
+ */
+void
+tp_build_context_set_num_fields(TpBuildContext *ctx, int num_fields)
+{
+	Assert(ctx != NULL);
+	Assert(ctx->num_docs == 0);
+
+	if (num_fields <= 1)
+		return;
+
+	ctx->num_fields		  = num_fields;
+	ctx->field_fieldnorms = palloc(
+			(size_t)ctx->docs_capacity * (size_t)num_fields * sizeof(uint8));
 }
 
 /*
@@ -107,19 +128,49 @@ build_context_grow_docs(TpBuildContext *ctx)
 
 	ctx->fieldnorms = repalloc(ctx->fieldnorms, new_capacity * sizeof(uint8));
 	ctx->ctids = repalloc(ctx->ctids, new_capacity * sizeof(ItemPointerData));
+	if (ctx->field_fieldnorms != NULL)
+		ctx->field_fieldnorms = repalloc(
+				ctx->field_fieldnorms,
+				(size_t)new_capacity * (size_t)ctx->num_fields *
+						sizeof(uint8));
 	ctx->docs_capacity = new_capacity;
 }
 
 /*
- * Add a single document's terms to the build context.
+ * Add a single document's terms to the build context (single-col / legacy).
  */
 uint32
 tp_build_context_add_document(
 		TpBuildContext *ctx,
 		char		  **terms,
 		int32		   *frequencies,
+		uint32		  **positions,
 		int				term_count,
 		int32			doc_length,
+		ItemPointer		ctid)
+{
+	return tp_build_context_add_document_multi(
+			ctx,
+			terms,
+			frequencies,
+			positions,
+			term_count,
+			doc_length,
+			NULL,
+			0,
+			ctid);
+}
+
+uint32
+tp_build_context_add_document_multi(
+		TpBuildContext *ctx,
+		char		  **terms,
+		int32		   *frequencies,
+		uint32		  **positions,
+		int				term_count,
+		int32			doc_length,
+		const int32	   *field_lengths,
+		int				num_fields,
 		ItemPointer		ctid)
 {
 	uint32 doc_id;
@@ -145,6 +196,35 @@ tp_build_context_add_document(
 	/* Store fieldnorm and CTID */
 	ctx->fieldnorms[doc_id] = norm;
 	ctx->ctids[doc_id]		= *ctid;
+
+	/*
+	 * Phase 6.1d: when this build is multi-col, encode and stash the
+	 * per-field fieldnorm so the term-append loop below picks the
+	 * field-specific byte for tagged terms.  Also accumulate per-field
+	 * totals for the metapage roll at end-of-batch.
+	 */
+	if (ctx->field_fieldnorms != NULL && ctx->num_fields > 1 &&
+		field_lengths != NULL)
+	{
+		size_t base = (size_t)doc_id * (size_t)ctx->num_fields;
+		int	   n	= Min(num_fields, ctx->num_fields);
+		int	   f;
+
+		memset(&ctx->field_fieldnorms[base], 0, ctx->num_fields);
+		for (f = 0; f < n; f++)
+		{
+			ctx->field_fieldnorms[base + f] = encode_fieldnorm(
+					(uint32)field_lengths[f]);
+			if (field_lengths[f] > 0)
+				ctx->total_len_per_field[f] += (uint64)field_lengths[f];
+		}
+	}
+	else if (ctx->num_fields <= 1 && doc_length > 0)
+	{
+		/* Single-col: keep total_len_per_field[0] in step with total_len */
+		ctx->total_len_per_field[0] += (uint64)doc_length;
+	}
+
 	ctx->num_docs++;
 	ctx->total_len += doc_length;
 
@@ -154,6 +234,7 @@ tp_build_context_add_document(
 		TpBuildTermEntry *entry;
 		bool			  found;
 		char			 *term_key;
+		uint8			  term_norm = norm;
 
 		/*
 		 * Look up or create the term entry. The hash table key
@@ -175,9 +256,33 @@ tp_build_context_add_document(
 			memcpy(arena_str, terms[i], len + 1);
 
 			/* Update entry to point to arena copy */
-			entry->term		= arena_str;
-			entry->term_len = len;
+			entry->term				  = arena_str;
+			entry->term_len			  = len;
+			entry->positions		  = NULL;
+			entry->positions_count	  = 0;
+			entry->positions_capacity = 0;
 			tp_expull_init(&entry->expull);
+		}
+
+		/*
+		 * Phase 6.1d: tagged term in a multi-col build → inline the
+		 * field-specific fieldnorm.  Tag byte 0x80 + f maps to column
+		 * f's quantized length we cached above.  Untagged terms keep
+		 * the total-doc fieldnorm.
+		 */
+		if (ctx->field_fieldnorms != NULL && ctx->num_fields > 1)
+		{
+			unsigned char first = (unsigned char)terms[i][0];
+			if (first >= TP_FIELD_TAG_BASE)
+			{
+				int fidx = first - TP_FIELD_TAG_BASE;
+				if (fidx >= 0 && fidx < ctx->num_fields)
+				{
+					size_t off = (size_t)doc_id * (size_t)ctx->num_fields +
+								 (size_t)fidx;
+					term_norm = ctx->field_fieldnorms[off];
+				}
+			}
 		}
 
 		/* Append posting to this term's EXPULL list */
@@ -186,7 +291,37 @@ tp_build_context_add_document(
 				&entry->expull,
 				doc_id,
 				(uint16)frequencies[i],
-				norm);
+				term_norm);
+
+		/*
+		 * If caller supplied positions for this term in this doc,
+		 * append them to the per-term flat stream. Storage is
+		 * palloc'd (not arena) since position lengths vary widely
+		 * per term and arena allocations are append-only.
+		 */
+		if (positions != NULL && positions[i] != NULL && frequencies[i] > 0)
+		{
+			uint32 needed = entry->positions_count + (uint32)frequencies[i];
+
+			if (needed > entry->positions_capacity)
+			{
+				uint32 new_cap = entry->positions_capacity
+									   ? entry->positions_capacity * 2
+									   : 8;
+				while (new_cap < needed)
+					new_cap *= 2;
+				if (entry->positions == NULL)
+					entry->positions = palloc(new_cap * sizeof(uint32));
+				else
+					entry->positions = repalloc(
+							entry->positions, new_cap * sizeof(uint32));
+				entry->positions_capacity = new_cap;
+			}
+			memcpy(entry->positions + entry->positions_count,
+				   positions[i],
+				   (size_t)frequencies[i] * sizeof(uint32));
+			entry->positions_count += (uint32)frequencies[i];
+		}
 	}
 
 	return doc_id;
@@ -230,10 +365,12 @@ tp_build_context_get_sorted_terms(TpBuildContext *ctx, uint32 *num_terms)
 	while ((entry = hash_seq_search(&status)) != NULL)
 	{
 		Assert(i < count);
-		terms[i].term	  = entry->term;
-		terms[i].term_len = entry->term_len;
-		terms[i].expull	  = &entry->expull;
-		terms[i].doc_freq = entry->expull.num_entries;
+		terms[i].term			 = entry->term;
+		terms[i].term_len		 = entry->term_len;
+		terms[i].expull			 = &entry->expull;
+		terms[i].doc_freq		 = entry->expull.num_entries;
+		terms[i].positions		 = entry->positions;
+		terms[i].positions_count = entry->positions_count;
 		i++;
 	}
 
@@ -528,6 +665,135 @@ tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 		pfree(bitset_data);
 	}
 
+	/*
+	 * V7 positions section (page writer, varint-delta encoded).
+	 * Emitted only when at least one term has captured positions.
+	 */
+	{
+		bool   any_positions = false;
+		uint32 term_idx;
+
+		for (term_idx = 0; term_idx < num_terms && !any_positions; term_idx++)
+		{
+			if (terms[term_idx].positions != NULL &&
+				terms[term_idx].positions_count > 0)
+				any_positions = true;
+		}
+
+		if (any_positions)
+		{
+			TpPositionsIndexEntry *pos_index;
+			uint8				 **per_term_buf;
+			uint32				  *per_term_len;
+			uint64				   data_rel_off = 0;
+			uint64				   positions_section_start;
+
+			header.positions_offset = writer.current_offset;
+			positions_section_start = writer.current_offset;
+
+			pos_index	 = palloc0(num_terms * sizeof(TpPositionsIndexEntry));
+			per_term_buf = palloc0(num_terms * sizeof(uint8 *));
+			per_term_len = palloc0(num_terms * sizeof(uint32));
+
+			/*
+			 * Encode each term's flat uint32 positions stream into
+			 * per-posting varint-delta runs. The flat positions[]
+			 * has frequencies consumed in posting order; we iterate
+			 * the EXPULL to get per-posting frequency and encode
+			 * `freq` positions at a time (positions reset per doc).
+			 */
+			for (term_idx = 0; term_idx < num_terms; term_idx++)
+			{
+				uint32		   pos_cursor = 0;
+				uint32		   enc_bytes  = 0;
+				uint32		   max_bytes;
+				uint8		  *buf = NULL;
+				TpExpullReader ereader;
+				TpExpullEntry  entry_buf[32];
+				uint32		   nread;
+
+				if (terms[term_idx].positions == NULL ||
+					terms[term_idx].positions_count == 0)
+					goto pos_term_done;
+
+				max_bytes = tp_positions_max_encoded_bytes(
+						terms[term_idx].positions_count);
+				buf = palloc(max_bytes);
+
+				tp_expull_reader_init(
+						&ereader, ctx->arena, terms[term_idx].expull);
+				while ((nread = tp_expull_reader_read(
+								&ereader, entry_buf, 32)) > 0)
+				{
+					uint32 i;
+					for (i = 0; i < nread; i++)
+					{
+						uint32 freq = entry_buf[i].frequency;
+						if (pos_cursor + freq >
+							terms[term_idx].positions_count)
+							freq = terms[term_idx].positions_count -
+								   pos_cursor;
+						if (freq == 0)
+							continue;
+						enc_bytes += tp_positions_encode_varint_delta(
+								terms[term_idx].positions + pos_cursor,
+								freq,
+								buf + enc_bytes);
+						pos_cursor += freq;
+					}
+				}
+
+			pos_term_done:
+				per_term_buf[term_idx]					  = buf;
+				per_term_len[term_idx]					  = enc_bytes;
+				pos_index[term_idx].positions_byte_offset = data_rel_off;
+				pos_index[term_idx].positions_byte_length =
+						tp_pos_encode_length(enc_bytes, /*varint=*/true);
+				data_rel_off += enc_bytes;
+			}
+
+			tp_segment_writer_write(
+					&writer,
+					pos_index,
+					num_terms * sizeof(TpPositionsIndexEntry));
+			pfree(pos_index);
+
+			for (term_idx = 0; term_idx < num_terms; term_idx++)
+			{
+				if (per_term_buf[term_idx] != NULL &&
+					per_term_len[term_idx] > 0)
+				{
+					tp_segment_writer_write(
+							&writer,
+							per_term_buf[term_idx],
+							per_term_len[term_idx]);
+					pfree(per_term_buf[term_idx]);
+				}
+			}
+			pfree(per_term_buf);
+			pfree(per_term_len);
+
+			header.positions_size = writer.current_offset -
+									positions_section_start;
+		}
+	}
+
+	header.fuzzy_index_offset = writer.current_offset;
+	{
+		TpFuzzyTermMeta *fuzzy_meta;
+		uint32			 term_idx;
+
+		fuzzy_meta = palloc(num_terms * sizeof(TpFuzzyTermMeta));
+		for (term_idx = 0; term_idx < num_terms; term_idx++)
+			tp_fuzzy_fill_term_meta(
+					terms[term_idx].term, &fuzzy_meta[term_idx]);
+		tp_segment_writer_write(
+				&writer, fuzzy_meta, num_terms * sizeof(TpFuzzyTermMeta));
+		pfree(fuzzy_meta);
+		header.fuzzy_index_size = writer.current_offset -
+								  header.fuzzy_index_offset;
+	}
+
 	/* Flush remaining buffered data */
 	tp_segment_writer_flush(&writer);
 
@@ -671,6 +937,8 @@ tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 		hdr->data_size			 = header.data_size;
 		hdr->num_pages			 = header.num_pages;
 		hdr->page_index			 = header.page_index;
+		hdr->positions_offset	 = header.positions_offset;
+		hdr->positions_size		 = header.positions_size;
 	}
 	MarkBufferDirty(header_buf);
 	UnlockReleaseBuffer(header_buf);
@@ -955,6 +1223,124 @@ tp_write_segment_to_buffile(TpBuildContext *ctx, BufFile *file)
 		pfree(ctid_offsets);
 	}
 
+	/*
+	 * V7 positions section (buffile writer, varint-delta encoded).
+	 */
+	{
+		bool   any_positions = false;
+		uint32 term_idx;
+
+		for (term_idx = 0; term_idx < num_terms && !any_positions; term_idx++)
+		{
+			if (terms[term_idx].positions != NULL &&
+				terms[term_idx].positions_count > 0)
+				any_positions = true;
+		}
+
+		if (any_positions)
+		{
+			TpPositionsIndexEntry *pos_index;
+			uint8				 **per_term_buf;
+			uint32				  *per_term_len;
+			uint64				   data_rel_off			   = 0;
+			uint64				   positions_section_start = current_offset;
+
+			header.positions_offset = current_offset;
+
+			pos_index	 = palloc0(num_terms * sizeof(TpPositionsIndexEntry));
+			per_term_buf = palloc0(num_terms * sizeof(uint8 *));
+			per_term_len = palloc0(num_terms * sizeof(uint32));
+
+			for (term_idx = 0; term_idx < num_terms; term_idx++)
+			{
+				uint32		   pos_cursor = 0;
+				uint32		   enc_bytes  = 0;
+				uint32		   max_bytes;
+				uint8		  *buf = NULL;
+				TpExpullReader ereader;
+				TpExpullEntry  entry_buf[32];
+				uint32		   nread;
+
+				if (terms[term_idx].positions == NULL ||
+					terms[term_idx].positions_count == 0)
+					goto pos_bterm_done;
+
+				max_bytes = tp_positions_max_encoded_bytes(
+						terms[term_idx].positions_count);
+				buf = palloc(max_bytes);
+
+				tp_expull_reader_init(
+						&ereader, ctx->arena, terms[term_idx].expull);
+				while ((nread = tp_expull_reader_read(
+								&ereader, entry_buf, 32)) > 0)
+				{
+					uint32 i;
+					for (i = 0; i < nread; i++)
+					{
+						uint32 freq = entry_buf[i].frequency;
+						if (pos_cursor + freq >
+							terms[term_idx].positions_count)
+							freq = terms[term_idx].positions_count -
+								   pos_cursor;
+						if (freq == 0)
+							continue;
+						enc_bytes += tp_positions_encode_varint_delta(
+								terms[term_idx].positions + pos_cursor,
+								freq,
+								buf + enc_bytes);
+						pos_cursor += freq;
+					}
+				}
+
+			pos_bterm_done:
+				per_term_buf[term_idx]					  = buf;
+				per_term_len[term_idx]					  = enc_bytes;
+				pos_index[term_idx].positions_byte_offset = data_rel_off;
+				pos_index[term_idx].positions_byte_length =
+						tp_pos_encode_length(enc_bytes, /*varint=*/true);
+				data_rel_off += enc_bytes;
+			}
+
+			BufFileWrite(
+					file,
+					pos_index,
+					num_terms * sizeof(TpPositionsIndexEntry));
+			current_offset += num_terms * sizeof(TpPositionsIndexEntry);
+			pfree(pos_index);
+
+			for (term_idx = 0; term_idx < num_terms; term_idx++)
+			{
+				if (per_term_buf[term_idx] != NULL &&
+					per_term_len[term_idx] > 0)
+				{
+					Size nbytes = per_term_len[term_idx];
+					BufFileWrite(file, per_term_buf[term_idx], nbytes);
+					current_offset += nbytes;
+					pfree(per_term_buf[term_idx]);
+				}
+			}
+			pfree(per_term_buf);
+			pfree(per_term_len);
+
+			header.positions_size = current_offset - positions_section_start;
+		}
+	}
+
+	header.fuzzy_index_offset = current_offset;
+	{
+		TpFuzzyTermMeta *fuzzy_meta;
+		uint32			 term_idx;
+
+		fuzzy_meta = palloc(num_terms * sizeof(TpFuzzyTermMeta));
+		for (term_idx = 0; term_idx < num_terms; term_idx++)
+			tp_fuzzy_fill_term_meta(
+					terms[term_idx].term, &fuzzy_meta[term_idx]);
+		BufFileWrite(file, fuzzy_meta, num_terms * sizeof(TpFuzzyTermMeta));
+		current_offset += num_terms * sizeof(TpFuzzyTermMeta);
+		pfree(fuzzy_meta);
+		header.fuzzy_index_size = current_offset - header.fuzzy_index_offset;
+	}
+
 	/* Final data_size */
 	header.data_size = current_offset;
 
@@ -1020,6 +1406,33 @@ tp_write_segment_to_buffile(TpBuildContext *ctx, BufFile *file)
 }
 
 /*
+ * Walk every term entry in the hash table and free its
+ * palloc'd positions buffer. Must run before hash_destroy() —
+ * the hash table doesn't run per-entry destructors.
+ */
+static void
+build_context_free_positions(TpBuildContext *ctx)
+{
+	HASH_SEQ_STATUS	  status;
+	TpBuildTermEntry *entry;
+
+	if (ctx == NULL || ctx->terms_ht == NULL)
+		return;
+
+	hash_seq_init(&status, ctx->terms_ht);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (entry->positions != NULL)
+		{
+			pfree(entry->positions);
+			entry->positions		  = NULL;
+			entry->positions_count	  = 0;
+			entry->positions_capacity = 0;
+		}
+	}
+}
+
+/*
  * Reset the build context for reuse.
  */
 void
@@ -1027,6 +1440,9 @@ tp_build_context_reset(TpBuildContext *ctx)
 {
 	if (ctx == NULL)
 		return;
+
+	/* Free per-term position buffers before destroying the hash table */
+	build_context_free_positions(ctx);
 
 	/* Reset arena (frees all pages except first) */
 	tp_arena_reset(ctx->arena);
@@ -1051,6 +1467,7 @@ tp_build_context_reset(TpBuildContext *ctx)
 	/* Reset document arrays (keep allocated memory) */
 	ctx->num_docs  = 0;
 	ctx->total_len = 0;
+	memset(ctx->total_len_per_field, 0, sizeof(ctx->total_len_per_field));
 }
 
 /*
@@ -1062,9 +1479,12 @@ tp_build_context_destroy(TpBuildContext *ctx)
 	if (ctx == NULL)
 		return;
 
+	build_context_free_positions(ctx);
 	tp_arena_destroy(ctx->arena);
 	hash_destroy(ctx->terms_ht);
 	pfree(ctx->fieldnorms);
 	pfree(ctx->ctids);
+	if (ctx->field_fieldnorms != NULL)
+		pfree(ctx->field_fieldnorms);
 	pfree(ctx);
 }

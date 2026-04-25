@@ -81,7 +81,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget ca-certificates build-essential bc \
+        sudo apt-get install -y wget ca-certificates build-essential libxml2-dev pkg-config bc \
             linux-tools-common linux-tools-generic linux-tools-$(uname -r) || true
         # Install FlameGraph for visualization
         git clone --depth 1 https://github.com/brendangregg/FlameGraph.git
@@ -92,8 +92,8 @@ jobs:
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | \
             sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-17 postgresql-server-dev-17 \
-            postgresql-17-dbgsym || sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+        sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libxml2-dev pkg-config \
+            postgresql-17-dbgsym || sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libxml2-dev pkg-config
 
     - name: Build extension (release with debug symbols)
       run: |
@@ -1088,7 +1088,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget ca-certificates build-essential bc
+        sudo apt-get install -y wget ca-certificates build-essential libxml2-dev pkg-config bc
         pip install wikiextractor
 
         # PostgreSQL
@@ -1097,7 +1097,7 @@ jobs:
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | \
             sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+        sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libxml2-dev pkg-config
 
     - name: Build extension (release mode)
       run: |
@@ -1646,7 +1646,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget ca-certificates build-essential bc
+        sudo apt-get install -y wget ca-certificates build-essential libxml2-dev pkg-config bc
         pip install wikiextractor
 
         # PostgreSQL
@@ -1655,7 +1655,7 @@ jobs:
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | \
             sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+        sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libxml2-dev pkg-config
 
     - name: Build extension (release mode)
       run: |
@@ -2594,7 +2594,7 @@ jobs:
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | \
             sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+        sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libxml2-dev pkg-config
 
     - name: Build extension
       run: |

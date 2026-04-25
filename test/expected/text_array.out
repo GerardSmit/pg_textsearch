@@ -1,6 +1,6 @@
 -- Test BM25 index on text[] columns
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v1.1.0
+INFO:  pg_textsearch v2.0.0
 -- Basic text array table and index
 CREATE TABLE docs_array (
     id SERIAL PRIMARY KEY,

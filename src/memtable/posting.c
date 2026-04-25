@@ -27,7 +27,8 @@
 int tp_posting_list_growth_factor = TP_POSTING_LIST_GROWTH_FACTOR;
 
 /*
- * Free a posting list and its entries array
+ * Free a posting list, its entries array, and any per-entry
+ * positions allocations.
  */
 void
 tp_free_posting_list(dsa_area *area, dsa_pointer posting_list_dp)
@@ -39,9 +40,19 @@ tp_free_posting_list(dsa_area *area, dsa_pointer posting_list_dp)
 
 	posting_list = (TpPostingList *)dsa_get_address(area, posting_list_dp);
 
-	/* Free entries array if it exists */
 	if (DsaPointerIsValid(posting_list->entries_dp))
+	{
+		TpPostingEntry *entries = (TpPostingEntry *)
+				dsa_get_address(area, posting_list->entries_dp);
+		int32 i;
+
+		for (i = 0; i < posting_list->doc_count; i++)
+		{
+			if (DsaPointerIsValid(entries[i].positions_dp))
+				dsa_free(area, entries[i].positions_dp);
+		}
 		dsa_free(area, posting_list->entries_dp);
+	}
 
 	/* Free the posting list structure itself */
 	dsa_free(area, posting_list_dp);
@@ -122,11 +133,13 @@ tp_add_document_to_posting_list(
 		TpLocalIndexState *local_state,
 		TpPostingList	  *posting_list,
 		ItemPointer		   ctid,
-		int32			   frequency)
+		int32			   frequency,
+		const uint32	  *positions)
 {
 	TpPostingEntry *entries;
 	TpPostingEntry *new_entry;
 	dsa_pointer		new_entries_dp;
+	dsa_pointer		positions_dp = InvalidDsaPointer;
 
 	Assert(local_state != NULL);
 	Assert(posting_list != NULL);
@@ -180,11 +193,26 @@ tp_add_document_to_posting_list(
 		posting_list->capacity	 = new_capacity;
 	}
 
+	/* Allocate and copy positions if caller provided them */
+	if (positions != NULL && frequency > 0)
+	{
+		uint32 *pos_buf;
+		Size	pos_size = (Size)frequency * sizeof(uint32);
+
+		positions_dp = dsa_allocate(local_state->dsa, pos_size);
+		if (!DsaPointerIsValid(positions_dp))
+			elog(ERROR, "Failed to allocate positions in DSA");
+		pos_buf = (uint32 *)dsa_get_address(local_state->dsa, positions_dp);
+		memcpy(pos_buf, positions, pos_size);
+	}
+
 	/* Add new document entry */
 	entries			= tp_get_posting_entries(local_state->dsa, posting_list);
 	new_entry		= &entries[posting_list->doc_count];
 	new_entry->ctid = *ctid;
-	new_entry->frequency = frequency;
+	new_entry->_pad = 0;
+	new_entry->frequency	= frequency;
+	new_entry->positions_dp = positions_dp;
 
 	posting_list->doc_count++;
 	posting_list->doc_freq	= posting_list->doc_count;
@@ -201,6 +229,130 @@ tp_add_document_to_posting_list(
 				local_state->dsa, local_state->shared->memtable_dp);
 		pg_atomic_fetch_add_u64(&memtable->total_postings, 1);
 	}
+}
+
+/*
+ * Binary-search a sorted ItemPointerData array for the given key.
+ * Returns the index on match, -1 on miss. Standard comparison is
+ * by BlockNumber then OffsetNumber.
+ */
+static int
+ctid_array_bsearch(
+		const ItemPointerData *arr, int n, const ItemPointerData *key)
+{
+	int lo = 0;
+	int hi = n - 1;
+	while (lo <= hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+		int cmp = ItemPointerCompare((ItemPointer)&arr[mid], (ItemPointer)key);
+		if (cmp == 0)
+			return mid;
+		else if (cmp < 0)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+	return -1;
+}
+
+void
+tp_memtable_collect_positions_batch(
+		TpLocalIndexState	  *local_state,
+		const char			  *term,
+		const ItemPointerData *sorted_targets,
+		int					   num_targets,
+		uint32				 **out_positions,
+		uint32				  *out_counts)
+{
+	TpPostingList  *posting_list;
+	TpPostingEntry *entries;
+	int32			i;
+
+	if (local_state == NULL || term == NULL || num_targets == 0)
+		return;
+
+	posting_list = tp_get_posting_list(local_state, term);
+	if (posting_list == NULL || posting_list->doc_count == 0 ||
+		!DsaPointerIsValid(posting_list->entries_dp))
+		return;
+
+	entries = (TpPostingEntry *)
+			dsa_get_address(local_state->dsa, posting_list->entries_dp);
+
+	for (i = 0; i < posting_list->doc_count; i++)
+	{
+		int	   idx;
+		uint32 freq;
+
+		idx = ctid_array_bsearch(
+				sorted_targets, num_targets, &entries[i].ctid);
+		if (idx < 0)
+			continue;
+
+		/* Already collected from another match-path? Skip. */
+		if (out_positions[idx] != NULL)
+			continue;
+
+		freq = (uint32)entries[i].frequency;
+		if (freq == 0 || !DsaPointerIsValid(entries[i].positions_dp))
+			continue;
+
+		out_positions[idx] = palloc(freq * sizeof(uint32));
+		memcpy(out_positions[idx],
+			   dsa_get_address(local_state->dsa, entries[i].positions_dp),
+			   freq * sizeof(uint32));
+		out_counts[idx] = freq;
+	}
+}
+
+uint32
+tp_memtable_read_positions_for_ctid(
+		TpLocalIndexState *local_state,
+		const char		  *term,
+		ItemPointerData	   target_ctid,
+		uint32			 **out_positions)
+{
+	TpPostingList  *posting_list;
+	TpPostingEntry *entries;
+	int32			i;
+
+	*out_positions = NULL;
+
+	if (local_state == NULL || term == NULL)
+		return 0;
+
+	posting_list = tp_get_posting_list(local_state, term);
+	if (posting_list == NULL || posting_list->doc_count == 0 ||
+		!DsaPointerIsValid(posting_list->entries_dp))
+		return 0;
+
+	entries = (TpPostingEntry *)
+			dsa_get_address(local_state->dsa, posting_list->entries_dp);
+
+	/*
+	 * Posting entries are sorted by ctid only after finalization.
+	 * The memtable is live — we linear scan. Posting lists are
+	 * bounded by the spill threshold so this is O(doc_count) per
+	 * lookup, acceptable at phrase-verify scale (~tens of candidates).
+	 */
+	for (i = 0; i < posting_list->doc_count; i++)
+	{
+		if (ItemPointerEquals(&entries[i].ctid, &target_ctid))
+		{
+			uint32 freq = (uint32)entries[i].frequency;
+
+			if (freq == 0 || !DsaPointerIsValid(entries[i].positions_dp))
+				return 0;
+
+			*out_positions = palloc(freq * sizeof(uint32));
+			memcpy(*out_positions,
+				   dsa_get_address(local_state->dsa, entries[i].positions_dp),
+				   freq * sizeof(uint32));
+			return freq;
+		}
+	}
+	return 0;
 }
 
 /*
@@ -326,6 +478,113 @@ tp_store_document_length(
 
 	dshash_release_lock(doclength_table, entry);
 	dshash_detach(doclength_table);
+}
+
+/*
+ * Phase 6.1d: per-field doc length table.  Same key (CTID), wider
+ * entry (TpDocFieldLengthEntry).  Reused functions for hash/compare/copy.
+ */
+dshash_table *
+tp_doc_field_length_table_create(dsa_area *area)
+{
+	dshash_parameters params;
+
+	params.key_size			= sizeof(ItemPointerData);
+	params.entry_size		= sizeof(TpDocFieldLengthEntry);
+	params.hash_function	= tp_doclength_hash_function;
+	params.compare_function = tp_doclength_compare_function;
+	params.copy_function	= tp_doclength_copy_function;
+	params.tranche_id		= TP_DOCLENGTH_HASH_TRANCHE_ID;
+
+	return dshash_create(area, &params, area);
+}
+
+dshash_table *
+tp_doc_field_length_table_attach(dsa_area *area, dshash_table_handle handle)
+{
+	dshash_parameters params;
+
+	params.key_size			= sizeof(ItemPointerData);
+	params.entry_size		= sizeof(TpDocFieldLengthEntry);
+	params.hash_function	= tp_doclength_hash_function;
+	params.compare_function = tp_doclength_compare_function;
+	params.copy_function	= tp_doclength_copy_function;
+	params.tranche_id		= TP_DOCLENGTH_HASH_TRANCHE_ID;
+
+	return dshash_attach(area, &params, handle, area);
+}
+
+void
+tp_store_document_field_lengths(
+		TpLocalIndexState *local_state,
+		ItemPointer		   ctid,
+		int32			   doc_length,
+		const int32		  *field_lengths,
+		int				   num_fields)
+{
+	TpMemtable			  *memtable;
+	dshash_table		  *fl_table;
+	TpDocFieldLengthEntry *entry;
+	bool				   found;
+	int					   n;
+	int					   f;
+
+	Assert(local_state != NULL);
+	Assert(ctid != NULL);
+	Assert(field_lengths != NULL);
+	Assert(num_fields > 0);
+
+	memtable = get_memtable(local_state);
+	if (!memtable)
+		elog(ERROR, "Cannot get memtable - index state corrupted");
+
+	if (memtable->doc_field_lengths_handle == DSHASH_HANDLE_INVALID)
+	{
+		fl_table = tp_doc_field_length_table_create(local_state->dsa);
+		memtable->doc_field_lengths_handle = dshash_get_hash_table_handle(
+				fl_table);
+	}
+	else
+	{
+		fl_table = tp_doc_field_length_table_attach(
+				local_state->dsa, memtable->doc_field_lengths_handle);
+	}
+
+	entry = (TpDocFieldLengthEntry *)
+			dshash_find_or_insert(fl_table, ctid, &found);
+	entry->ctid		  = *ctid;
+	entry->doc_length = doc_length;
+	memset(entry->field_lengths, 0, sizeof(entry->field_lengths));
+	n = num_fields < TP_MAX_FIELDS ? num_fields : TP_MAX_FIELDS;
+	for (f = 0; f < n; f++)
+		entry->field_lengths[f] = field_lengths[f];
+
+	dshash_release_lock(fl_table, entry);
+	dshash_detach(fl_table);
+}
+
+int32
+tp_get_document_field_length_attached(
+		dshash_table *fl_table, ItemPointer ctid, int field_idx)
+{
+	TpDocFieldLengthEntry *entry;
+
+	Assert(fl_table != NULL);
+	Assert(ctid != NULL);
+
+	entry = (TpDocFieldLengthEntry *)dshash_find(fl_table, ctid, false);
+	if (entry)
+	{
+		int32 v;
+
+		if (field_idx < 0 || field_idx >= TP_MAX_FIELDS)
+			v = entry->doc_length;
+		else
+			v = entry->field_lengths[field_idx];
+		dshash_release_lock(fl_table, entry);
+		return v;
+	}
+	return -1;
 }
 
 /*

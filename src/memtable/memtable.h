@@ -32,6 +32,20 @@ typedef struct TpDocLengthEntry
 								 * frequencies) */
 } TpDocLengthEntry;
 
+/*
+ * Phase 6.1d: per-doc per-field length entry for multi-col indexes.
+ * Lives in a SEPARATE dshash from TpDocLengthEntry so single-col
+ * indexes don't pay for unused per-field slots — TpDocLengthEntry
+ * stays 12 bytes for them.  doc_length here mirrors the value in
+ * TpDocLengthEntry; field_lengths[f] is the per-column length.
+ */
+typedef struct TpDocFieldLengthEntry
+{
+	ItemPointerData ctid;
+	int32			doc_length;
+	int32			field_lengths[TP_MAX_FIELDS];
+} TpDocFieldLengthEntry;
+
 /* Default hash table size */
 #define TP_DEFAULT_HASH_BUCKETS 1024
 

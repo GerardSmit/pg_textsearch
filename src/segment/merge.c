@@ -27,6 +27,7 @@
 #include "segment/merge_internal.h"
 #include "segment/pagemapper.h"
 #include "segment/segment.h"
+#include "types/fuzzy.h"
 
 /* Sentinel for dead docs in old_to_new mapping */
 #define TP_MERGE_DOC_DEAD UINT32_MAX
@@ -991,8 +992,51 @@ write_merged_segment_to_sink(
 	uint32		 skip_entries_count;
 	uint32		 skip_entries_capacity;
 
+	/*
+	 * V6 positions propagation. We emit positions in the merged
+	 * segment only when EVERY source segment carries them (either V6
+	 * with positions_offset != 0, or an empty segment which is a no-op).
+	 * Mixed V5/V6 sources drop positions in the merged output and
+	 * phrase queries fall back to heap re-fetch for those docs.
+	 */
+	bool	emit_positions	 = true;
+	uint8  *positions_buf	 = NULL;
+	uint64	positions_bytes	 = 0;
+	uint64	positions_cap	 = 0;
+	uint64 *per_term_pos_off = NULL; /* output byte offset per term */
+	uint64 *per_term_pos_len = NULL; /* output byte length per term */
+	/*
+	 * Per-source state, reset per term. Decoded absolute positions
+	 * for this term live in src_decoded[src] of length
+	 * src_decoded_count[src]; src_freq_prefix[src] is the number of
+	 * uint32 positions already CONSUMED from src_decoded[src] during
+	 * the posting-loop merge (bumped for both emitted AND dead
+	 * postings so it tracks source-side consumption).
+	 */
+	uint32 **src_decoded	   = NULL;
+	uint32	*src_decoded_count = NULL;
+	uint64	*src_freq_prefix   = NULL;
+
 	if (num_terms == 0)
 		return;
+
+	/* Gate emit_positions: all sources must have V6 positions */
+	for (i = 0; i < (uint32)num_sources; i++)
+	{
+		TpSegmentReader *r = sources[i].reader;
+		if (r == NULL || r->header == NULL)
+		{
+			emit_positions = false;
+			break;
+		}
+		if (r->header->num_terms == 0)
+			continue; /* empty segment: no positions section needed */
+		if (r->header->positions_offset == 0)
+		{
+			emit_positions = false;
+			break;
+		}
+	}
 
 	/* Build docmap and direct mapping arrays from source segments */
 	docmap = build_merged_docmap(
@@ -1014,6 +1058,17 @@ write_merged_segment_to_sink(
 		free_merge_doc_mapping(&doc_mapping);
 		tp_docmap_destroy(docmap);
 		return;
+	}
+
+	if (emit_positions)
+	{
+		positions_cap	  = 4096;
+		positions_buf	  = palloc(positions_cap);
+		per_term_pos_off  = palloc0(num_terms * sizeof(uint64));
+		per_term_pos_len  = palloc0(num_terms * sizeof(uint64));
+		src_decoded		  = palloc0(num_sources * sizeof(uint32 *));
+		src_decoded_count = palloc0(num_sources * sizeof(uint32));
+		src_freq_prefix	  = palloc(num_sources * sizeof(uint64));
 	}
 
 	/* Prepare header placeholder */
@@ -1170,7 +1225,164 @@ write_merged_segment_to_sink(
 		{
 			term_blocks[i].doc_freq	   = 0;
 			term_blocks[i].block_count = 0;
+			if (emit_positions)
+			{
+				per_term_pos_off[i] = positions_bytes;
+				per_term_pos_len[i] = 0;
+			}
 			continue;
+		}
+
+		/*
+		 * Per-term positions setup. For each source_ref holding
+		 * this term, decode the source's full positions run into a
+		 * uint32 array so the merge loop can slice by frequency
+		 * regardless of source encoding (raw or varint). The
+		 * decoded buffer is freed at term teardown.
+		 */
+		if (emit_positions)
+		{
+			uint32 r;
+
+			per_term_pos_off[i] = positions_bytes;
+
+			for (r = 0; r < terms[i].num_segment_refs; r++)
+			{
+				TpSegmentReader *sr =
+						sources[terms[i].segment_refs[r].segment_idx].reader;
+				TpPositionsIndexEntry pe;
+				uint32				  src_dict_idx;
+				uint64				  pos_data_start;
+				uint64				  raw_byte_len;
+				bool				  is_varint;
+				uint32				  total_positions;
+
+				src_decoded[r]		 = NULL;
+				src_decoded_count[r] = 0;
+				src_freq_prefix[r]	 = 0;
+
+				if (sr == NULL || sr->header == NULL ||
+					sr->header->positions_offset == 0)
+					continue;
+
+				src_dict_idx = tp_segment_find_dict_idx(sr, terms[i].term);
+				if (src_dict_idx == UINT32_MAX)
+					continue;
+				if (!tp_segment_read_positions_index_entry(
+							sr, src_dict_idx, &pe))
+					continue;
+
+				raw_byte_len = tp_pos_length(pe.positions_byte_length);
+				if (raw_byte_len == 0)
+					continue;
+				is_varint	   = tp_pos_is_varint(pe.positions_byte_length);
+				pos_data_start = sr->header->positions_offset +
+								 (uint64)sr->header->num_terms *
+										 sizeof(TpPositionsIndexEntry) +
+								 pe.positions_byte_offset;
+
+				/*
+				 * Total positions count = sum of frequencies in
+				 * source's posting list for this term. For raw
+				 * encoding that's raw_byte_len / 4. For varint we
+				 * need to either scan the source postings OR derive
+				 * it from the dict entry's doc_freq × avg (we can't).
+				 * So for varint we decode by counting as we go —
+				 * read the whole bytes, decode all positions.
+				 *
+				 * Simpler uniform path: raw → total = raw_byte_len/4,
+				 * varint → decode everything from bytes until stream
+				 * ends (but decoder needs count). Compromise: track
+				 * posting_count × frequency-sum through dict lookup.
+				 * For now, for raw use raw_byte_len/4; for varint
+				 * allocate max-possible (raw_byte_len in uint32,
+				 * since varint can expand at most 1:5 but NEVER
+				 * shrink compared to... wait this is backwards).
+				 *
+				 * Actually simplest: for varint we know the source
+				 * posting iterator's aggregate frequency is the
+				 * position count. We get that from the source's dict
+				 * entry via iteration. Do one posting-list scan to
+				 * count, then decode. OR decode greedily.
+				 *
+				 * Workable simplification: read the source's raw
+				 * varint bytes into a temp buffer, then run the
+				 * posting iterator on the source, and for each
+				 * posting decode frequency positions. Build the
+				 * decoded array on the fly.
+				 */
+				{
+					TpSegmentPostingIterator src_iter;
+					TpSegmentPosting		*sp;
+					uint8					*temp_buf	   = NULL;
+					uint32					 varint_cursor = 0;
+					uint32					 decoded_cap   = 64;
+					uint32					 decoded_n	   = 0;
+					uint32 *decoded = palloc(decoded_cap * sizeof(uint32));
+
+					if (is_varint)
+					{
+						if (raw_byte_len > (uint64)UINT32_MAX)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATA_CORRUPTED),
+									 errmsg("merge: positions section "
+											"too large")));
+						temp_buf = palloc((uint32)raw_byte_len);
+						tp_segment_read(
+								sr,
+								pos_data_start,
+								temp_buf,
+								(uint32)raw_byte_len);
+					}
+
+					if (!tp_segment_posting_iterator_init(
+								&src_iter, sr, terms[i].term))
+					{
+						if (temp_buf)
+							pfree(temp_buf);
+						pfree(decoded);
+						continue;
+					}
+					while (tp_segment_posting_iterator_next(&src_iter, &sp))
+					{
+						uint16 f = sp->frequency;
+						if (f == 0)
+							continue;
+						if (decoded_n + f > decoded_cap)
+						{
+							while (decoded_cap < decoded_n + f)
+								decoded_cap *= 2;
+							decoded = repalloc(
+									decoded, decoded_cap * sizeof(uint32));
+						}
+						if (is_varint)
+						{
+							varint_cursor += tp_positions_decode_varint_delta(
+									temp_buf + varint_cursor,
+									(uint32)raw_byte_len - varint_cursor,
+									f,
+									decoded + decoded_n);
+						}
+						else
+						{
+							tp_segment_read(
+									sr,
+									pos_data_start +
+											(uint64)decoded_n * sizeof(uint32),
+									decoded + decoded_n,
+									f * sizeof(uint32));
+						}
+						decoded_n += f;
+					}
+					tp_segment_posting_iterator_free(&src_iter);
+					if (temp_buf)
+						pfree(temp_buf);
+
+					src_decoded[r]		 = decoded;
+					src_decoded_count[r] = decoded_n;
+					(void)total_positions;
+				}
+			}
 		}
 
 		if (disjoint_sources)
@@ -1194,19 +1406,52 @@ write_merged_segment_to_sink(
 					int	   seg_idx = terms[i].segment_refs[src].segment_idx;
 					uint32 new_id =
 							doc_mapping.old_to_new[seg_idx][bp->doc_id];
+					uint16 this_freq = bp->frequency;
 
 					if (new_id == TP_MERGE_DOC_DEAD)
 					{
+						/*
+						 * Dead entries consume positions bytes in
+						 * the source too — advance the source
+						 * freq-prefix even though we don't emit.
+						 */
+						if (emit_positions)
+							src_freq_prefix[src] += this_freq;
 						posting_source_advance_fast(&psources[src]);
 						continue;
 					}
 
 					block_buf[block_count].doc_id	 = new_id;
-					block_buf[block_count].frequency = bp->frequency;
+					block_buf[block_count].frequency = this_freq;
 					block_buf[block_count].fieldnorm = bp->fieldnorm;
 					block_buf[block_count].reserved	 = 0;
 					block_count++;
 					doc_count++;
+
+					/* Emit this posting's positions (varint-encoded). */
+					if (emit_positions && this_freq > 0 &&
+						src_decoded[src] != NULL &&
+						src_freq_prefix[src] + this_freq <=
+								src_decoded_count[src])
+					{
+						uint64 max_bytes = tp_positions_max_encoded_bytes(
+								this_freq);
+						uint64 new_total = positions_bytes + max_bytes;
+						uint32 enc;
+						if (new_total > positions_cap)
+						{
+							while (positions_cap < new_total)
+								positions_cap *= 2;
+							positions_buf = repalloc_huge(
+									positions_buf, positions_cap);
+						}
+						enc = tp_positions_encode_varint_delta(
+								src_decoded[src] + src_freq_prefix[src],
+								this_freq,
+								positions_buf + positions_bytes);
+						positions_bytes += enc;
+						src_freq_prefix[src] += this_freq;
+					}
 
 					posting_source_advance_fast(&psources[src]);
 
@@ -1235,21 +1480,48 @@ write_merged_segment_to_sink(
 				{
 					int src_idx = terms[i].segment_refs[min_idx].segment_idx;
 					uint32 old_doc_id = psources[min_idx].current.old_doc_id;
+					uint16 this_freq  = psources[min_idx].current.frequency;
 					uint32 new_id =
 							doc_mapping.old_to_new[src_idx][old_doc_id];
 
 					if (new_id == TP_MERGE_DOC_DEAD)
 					{
+						if (emit_positions)
+							src_freq_prefix[min_idx] += this_freq;
 						posting_source_advance(&psources[min_idx]);
 						continue;
 					}
 
-					block_buf[block_count].doc_id = new_id;
-					block_buf[block_count].frequency =
-							psources[min_idx].current.frequency;
+					block_buf[block_count].doc_id	 = new_id;
+					block_buf[block_count].frequency = this_freq;
 					block_buf[block_count].fieldnorm =
 							psources[min_idx].current.fieldnorm;
 					block_buf[block_count].reserved = 0;
+
+					if (emit_positions && this_freq > 0 &&
+						src_decoded[min_idx] != NULL &&
+						src_freq_prefix[min_idx] + this_freq <=
+								src_decoded_count[min_idx])
+					{
+						uint64 max_bytes = tp_positions_max_encoded_bytes(
+								this_freq);
+						uint64 new_total = positions_bytes + max_bytes;
+						uint32 enc;
+						if (new_total > positions_cap)
+						{
+							while (positions_cap < new_total)
+								positions_cap *= 2;
+							positions_buf = repalloc_huge(
+									positions_buf, positions_cap);
+						}
+						enc = tp_positions_encode_varint_delta(
+								src_decoded[min_idx] +
+										src_freq_prefix[min_idx],
+								this_freq,
+								positions_buf + positions_bytes);
+						positions_bytes += enc;
+						src_freq_prefix[min_idx] += this_freq;
+					}
 				}
 				block_count++;
 				doc_count++;
@@ -1270,6 +1542,22 @@ write_merged_segment_to_sink(
 
 		term_blocks[i].doc_freq	   = doc_count;
 		term_blocks[i].block_count = num_blocks;
+
+		if (emit_positions)
+		{
+			uint32 r;
+			per_term_pos_len[i] = positions_bytes - per_term_pos_off[i];
+			/* Free per-source decoded buffers for THIS term */
+			for (r = 0; r < terms[i].num_segment_refs; r++)
+			{
+				if (src_decoded[r] != NULL)
+				{
+					pfree(src_decoded[r]);
+					src_decoded[r]		 = NULL;
+					src_decoded_count[r] = 0;
+				}
+			}
+		}
 
 		free_term_posting_sources(psources, num_psources);
 
@@ -1334,6 +1622,88 @@ write_merged_segment_to_sink(
 		merge_sink_write(sink, bitset_data, bitset_size);
 		pfree(bitset_data);
 	}
+
+	/*
+	 * V6 positions section. When every source carried positions we
+	 * already collected per-term positions_buf slices during the
+	 * posting loop; now flush the positions index followed by the
+	 * concatenated data. When any source was V5 or V6-no-positions,
+	 * emit_positions is false and we leave the output as V6-no-
+	 * positions (phrase queries fall back to heap re-fetch).
+	 */
+	if (emit_positions && positions_bytes > 0)
+	{
+		TpPositionsIndexEntry *pos_index;
+		uint32				   t;
+
+		header.positions_offset = sink->current_offset;
+
+		pos_index = palloc0(num_terms * sizeof(TpPositionsIndexEntry));
+		for (t = 0; t < num_terms; t++)
+		{
+			pos_index[t].positions_byte_offset = per_term_pos_off[t];
+			pos_index[t].positions_byte_length =
+					tp_pos_encode_length(per_term_pos_len[t], /*varint=*/true);
+		}
+		merge_sink_write(
+				sink, pos_index, num_terms * sizeof(TpPositionsIndexEntry));
+		pfree(pos_index);
+
+		/*
+		 * merge_sink_write takes uint32 sizes; chunk the positions
+		 * buffer if it exceeds that. In practice positions_bytes is
+		 * bounded by total_tokens * 4 which fits in uint32 for
+		 * multi-GB segments.
+		 */
+		{
+			uint64 remaining = positions_bytes;
+			uint64 offset	 = 0;
+			while (remaining > 0)
+			{
+				uint32 chunk = remaining > (uint64)UINT32_MAX
+									 ? UINT32_MAX
+									 : (uint32)remaining;
+				merge_sink_write(sink, positions_buf + offset, chunk);
+				offset += chunk;
+				remaining -= chunk;
+			}
+		}
+
+		header.positions_size = sink->current_offset - header.positions_offset;
+	}
+	else
+	{
+		header.positions_offset = 0;
+		header.positions_size	= 0;
+	}
+
+	header.fuzzy_index_offset = sink->current_offset;
+	{
+		TpFuzzyTermMeta *fuzzy_meta;
+		uint32			 t;
+
+		fuzzy_meta = palloc(num_terms * sizeof(TpFuzzyTermMeta));
+		for (t = 0; t < num_terms; t++)
+			tp_fuzzy_fill_term_meta(terms[t].term, &fuzzy_meta[t]);
+		merge_sink_write(
+				sink, fuzzy_meta, num_terms * sizeof(TpFuzzyTermMeta));
+		pfree(fuzzy_meta);
+		header.fuzzy_index_size = sink->current_offset -
+								  header.fuzzy_index_offset;
+	}
+
+	if (positions_buf)
+		pfree(positions_buf);
+	if (per_term_pos_off)
+		pfree(per_term_pos_off);
+	if (per_term_pos_len)
+		pfree(per_term_pos_len);
+	if (src_decoded)
+		pfree(src_decoded);
+	if (src_decoded_count)
+		pfree(src_decoded_count);
+	if (src_freq_prefix)
+		pfree(src_freq_prefix);
 
 	/* Finalize data_size */
 	header.data_size = sink->current_offset;

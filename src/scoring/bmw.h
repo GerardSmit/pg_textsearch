@@ -15,6 +15,7 @@
 #include <utils/memutils.h>
 
 #include "index/state.h"
+#include "segment/io.h"
 #include "segment/segment.h"
 
 /*
@@ -124,6 +125,88 @@ typedef struct TpBMWStats
  *
  * Returns number of results (up to max_results).
  */
+/*
+ * Walk the segment chains rooted in metap->level_heads and return a
+ * palloc'd array of segment-root BlockNumbers (across all levels).
+ * Caller pfrees *out_roots.  Returns 0 when the index has no segments.
+ *
+ * Used by serial BMW to iterate; parallel-scan workers (parallel scan)
+ * claim indices into the array via an atomic counter.
+ */
+extern int tp_collect_segment_roots(
+		Relation index, TpIndexMetaPage metap, BlockNumber **out_roots);
+
+/*
+ * Per-term scoring state for multi-term BMW.  Public so parallel-
+ * scan workers (parallel scan) can construct their own array per segment.
+ */
+typedef struct TpTermState
+{
+	const char *term;
+	float4		idf;
+	int32		query_freq; /* Query term frequency (for boosting) */
+
+	/*
+	 * Per-term BM25F state.
+	 *   field_idx == -1 → untagged (single-col or unqualified
+	 *                     in legacy index): use avg_doc_len = corpus avg.
+	 *   field_idx >=  0 → tagged to that column: use avg_doc_len =
+	 *                     metap->total_len_per_field[field_idx]/total_docs
+	 */
+	int	   field_idx;
+	float4 avg_doc_len;
+
+	/* Global maximum score across all blocks (for WAND pivot) */
+	float4 max_score;
+
+	/* Segment-specific state (reset per segment) */
+	bool					 found; /* Term found in current segment */
+	TpSegmentPostingIterator iter;	/* Iterator (contains dict_entry) */
+	float4 *block_max_scores;		/* Pre-computed block max scores */
+	uint32 *block_last_doc_ids;		/* Cached last_doc_id per block */
+	uint32	cur_doc_id;				/* Cached current doc ID */
+} TpTermState;
+
+/*
+ * Memtable scoring — exhaustive scan, no skip index.  Public so
+ * parallel-scan leader can score memtable into its own heap.
+ */
+extern void score_memtable_single_term(
+		TpTopKHeap		  *heap,
+		TpLocalIndexState *local_state,
+		const char		  *term,
+		float4			   idf,
+		float4			   k1,
+		float4			   b,
+		float4			   avg_doc_len,
+		TpBMWStats		  *stats);
+
+/*
+ * Per-segment BMW scoring entrypoints — caller supplies an open
+ * reader and a heap.  These are what parallel-scan workers will call
+ * once they've claimed a segment from the work-stealing array.  The
+ * serial path (tp_score_*_term_bmw) calls them too.
+ */
+extern void score_segment_single_term_bmw(
+		TpTopKHeap		*heap,
+		TpSegmentReader *reader,
+		const char		*term,
+		float4			 idf,
+		float4			 k1,
+		float4			 b,
+		float4			 avg_doc_len,
+		TpBMWStats		*stats);
+
+extern void score_segment_multi_term_bmw(
+		TpTopKHeap		*heap,
+		TpSegmentReader *reader,
+		TpTermState	   **terms,
+		int				 term_count,
+		float4			 k1,
+		float4			 b,
+		float4			 avg_doc_len,
+		TpBMWStats		*stats);
+
 extern int tp_score_single_term_bmw(
 		TpLocalIndexState *local_state,
 		Relation		   index,
@@ -152,13 +235,15 @@ extern int tp_score_multi_term_bmw(
 		int				   term_count,
 		int32			  *query_freqs,
 		float4			  *idfs,
-		float4			   k1,
-		float4			   b,
-		float4			   avg_doc_len,
-		int				   max_results,
-		ItemPointerData	  *result_ctids,
-		float4			  *result_scores,
-		TpBMWStats		  *stats);
+		const float4	  *avg_doc_lens, /* per-term BM25F;
+										  * NULL → uniform avg_doc_len */
+		float4			 k1,
+		float4			 b,
+		float4			 avg_doc_len,
+		int				 max_results,
+		ItemPointerData *result_ctids,
+		float4			*result_scores,
+		TpBMWStats		*stats);
 
 /*
  * Compute block maximum BM25 score from skip entry metadata.

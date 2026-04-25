@@ -14,6 +14,7 @@
 #include <utils/dsa.h>
 
 #include "memtable/posting.h"
+#include "types/fuzzy.h"
 
 typedef struct TpStringHashEntry TpStringHashEntry;
 
@@ -69,18 +70,53 @@ extern void tp_string_table_clear(dsa_area *area, dshash_table *ht);
 /* Ensure the string hash table is initialized (call under EXCLUSIVE) */
 extern void tp_ensure_string_table_initialized(TpLocalIndexState *local_state);
 
-/* Document term management functions */
+/*
+ * Document term management.
+ *
+ * positions is an optional array of position arrays — one entry per
+ * term, each entry a uint32[frequencies[i]]. May be NULL when the
+ * caller doesn't have positions (e.g. with_positions=false). Per-entry
+ * NULL elements are also accepted.
+ */
 extern void tp_add_document_terms(
 		TpLocalIndexState *local_state,
 		ItemPointer		   ctid,
 		char			 **terms,
 		int32			  *frequencies,
+		uint32			 **positions,
 		int				   term_count,
-		int32			   doc_length);
+		int32			   doc_length,
+		const int32		  *field_lengths,
+		int				   num_fields);
 
 /* Posting list access via string table */
 extern TpPostingList *tp_string_table_get_posting_list(
 		dsa_area *area, dshash_table *ht, const char *term);
+
+/*
+ * Collect memtable terms starting with 'prefix', up to max_terms.
+ * Output array and individual strings are palloc'd in the current
+ * memory context. *out_terms is NULL when no matches.
+ *
+ * Iteration is O(num_terms) since dshash is unordered. The memtable
+ * is bounded by spill thresholds (GUC pg_textsearch.memtable_spill_threshold)
+ * so this is acceptable.
+ */
+extern void tp_memtable_collect_prefix_terms(
+		TpLocalIndexState *local_state,
+		const char		  *prefix,
+		int				   max_terms,
+		char			***out_terms,
+		int				  *out_count);
+
+extern void tp_memtable_collect_fuzzy_terms(
+		TpLocalIndexState *local_state,
+		const char		  *query_term,
+		int				   max_distance,
+		int				   max_terms,
+		bool			   prefix,
+		TpFuzzyCandidate **out_candidates,
+		int				  *out_count);
 
 /* Posting list management in DSA */
 extern dsa_pointer tp_alloc_posting_list(dsa_area *dsa);

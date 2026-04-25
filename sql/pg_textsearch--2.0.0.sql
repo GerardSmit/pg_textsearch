@@ -1,0 +1,433 @@
+-- pg_textsearch extension version 2.0.0
+--
+-- 2.0.0: Clean-slate format break.  Pre-2.0 indexes are not readable
+-- and require DROP/CREATE.  Carries forward (from the dev series):
+--   * prefix queries 'foo*' and bm25_prefix()
+--   * phrase / phrase-prefix queries '"foo bar"' / '"foo bar*"'
+--   * V6 positions in segments, varint-delta encoded
+--   * multi-column indexes with field:term grammar (Phase 6.1-core)
+--   * field_weights reloption (Phase 6.1b)
+--   * record LHS operator '(a, b) <@> bm25query' (Phase 6.1c)
+--   * unified to_bm25query(text, index, grammar, fuzzy_max_distance)
+
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION pg_textsearch" to load this file. \quit
+
+-- Verify loaded library matches this SQL script version
+DO $$
+DECLARE
+    lib_ver text;
+BEGIN
+    lib_ver := pg_catalog.current_setting('pg_textsearch.library_version', true);
+    IF lib_ver IS NULL THEN
+        RAISE EXCEPTION
+            'pg_textsearch library not loaded. '
+            'Add pg_textsearch to shared_preload_libraries and restart.';
+    END IF;
+    IF lib_ver OPERATOR(pg_catalog.<>) '2.0.0' THEN
+        RAISE EXCEPTION
+            'pg_textsearch library version mismatch: loaded=%, expected=%. '
+            'Restart the server after installing the new binary.',
+            lib_ver, '2.0.0';
+    END IF;
+END $$;
+
+-- Access method
+
+CREATE FUNCTION @extschema@.tp_handler(internal)
+RETURNS index_am_handler
+AS 'MODULE_PATHNAME', 'tp_handler'
+LANGUAGE C;
+
+CREATE ACCESS METHOD bm25 TYPE INDEX HANDLER @extschema@.tp_handler;
+
+-- bm25vector type
+
+CREATE FUNCTION @extschema@.bm25vector_in(cstring)
+RETURNS @extschema@.bm25vector
+AS 'MODULE_PATHNAME', 'tpvector_in'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25vector_out(@extschema@.bm25vector)
+RETURNS cstring
+AS 'MODULE_PATHNAME', 'tpvector_out'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25vector_recv(internal)
+RETURNS @extschema@.bm25vector
+AS 'MODULE_PATHNAME', 'tpvector_recv'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25vector_send(@extschema@.bm25vector)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'tpvector_send'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE TYPE @extschema@.bm25vector (
+    INPUT = @extschema@.bm25vector_in,
+    OUTPUT = @extschema@.bm25vector_out,
+    RECEIVE = @extschema@.bm25vector_recv,
+    SEND = @extschema@.bm25vector_send,
+    STORAGE = extended,
+    ALIGNMENT = int4
+);
+
+-- bm25query type
+
+CREATE FUNCTION @extschema@.bm25query_in(cstring)
+RETURNS @extschema@.bm25query
+AS 'MODULE_PATHNAME', 'tpquery_in'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25query_out(@extschema@.bm25query)
+RETURNS cstring
+AS 'MODULE_PATHNAME', 'tpquery_out'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25query_recv(internal)
+RETURNS @extschema@.bm25query
+AS 'MODULE_PATHNAME', 'tpquery_recv'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25query_send(@extschema@.bm25query)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'tpquery_send'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE TYPE @extschema@.bm25query (
+    INPUT = @extschema@.bm25query_in,
+    OUTPUT = @extschema@.bm25query_out,
+    RECEIVE = @extschema@.bm25query_recv,
+    SEND = @extschema@.bm25query_send,
+    STORAGE = extended,
+    ALIGNMENT = int4
+);
+
+-- Convert text to bm25query
+CREATE FUNCTION @extschema@.to_bm25query(
+    input_text text,
+    index_name text DEFAULT NULL,
+    grammar boolean DEFAULT false,
+    fuzzy_max_distance int DEFAULT 0)
+RETURNS @extschema@.bm25query
+AS 'MODULE_PATHNAME', 'to_tpquery_unified'
+LANGUAGE C IMMUTABLE PARALLEL SAFE;
+
+
+-- Equality function: bm25vector = bm25vector → boolean
+CREATE FUNCTION @extschema@.bm25vector_eq(@extschema@.bm25vector, @extschema@.bm25vector)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'tpvector_eq'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- Create the = operator for equality
+CREATE OPERATOR @extschema@.= (
+    LEFTARG = @extschema@.bm25vector,
+    RIGHTARG = @extschema@.bm25vector,
+    FUNCTION = @extschema@.bm25vector_eq,
+    COMMUTATOR = OPERATOR(@extschema@.=),
+    HASHES
+);
+
+
+-- BM25 scoring function for text <@> bm25query operations
+--
+-- COST 1000: Standalone scoring is expensive. Each call parses document text
+-- with to_tsvector (~14μs per doc), opens the index, looks up IDF values, and
+-- calculates BM25 scores. High cost helps planner prefer index scans.
+CREATE FUNCTION @extschema@.bm25_text_bm25query_score(left_text text, right_query @extschema@.bm25query)
+RETURNS float8
+AS 'MODULE_PATHNAME', 'bm25_text_bm25query_score'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 1000;
+
+-- bm25query equality function
+CREATE FUNCTION @extschema@.bm25query_eq(@extschema@.bm25query, @extschema@.bm25query)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'tpquery_eq'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+
+
+-- <@> operator for text <@> bm25query operations
+CREATE OPERATOR @extschema@.<@> (
+    LEFTARG = text,
+    RIGHTARG = @extschema@.bm25query,
+    PROCEDURE = @extschema@.bm25_text_bm25query_score
+);
+
+-- Function for text <@> text operator (planner hook rewrites to text <@> bm25query)
+-- COST 1000: High cost makes planner prefer index scans over seq scan + sort.
+-- In practice, this function errors without index scan context, but the cost
+-- helps the planner choose the right path before execution.
+CREATE FUNCTION @extschema@.bm25_text_text_score(text, text) RETURNS float8
+    AS 'MODULE_PATHNAME', 'bm25_text_text_score'
+    LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 1000;
+
+-- Stub function returning cached score from index scan.
+-- The planner hook replaces resjunk ORDER BY expressions with calls to this
+-- function, avoiding expensive re-computation of BM25 scores.
+CREATE FUNCTION @extschema@.bm25_get_current_score() RETURNS float8
+    AS 'MODULE_PATHNAME', 'bm25_get_current_score'
+    LANGUAGE C VOLATILE STRICT PARALLEL SAFE;
+
+-- <@> operator for text <@> text operations (implicit index resolution)
+-- The planner hook transforms this to text <@> bm25query when a BM25 index exists
+CREATE OPERATOR @extschema@.<@> (
+    LEFTARG = text,
+    RIGHTARG = text,
+    PROCEDURE = @extschema@.bm25_text_text_score
+);
+
+-- = operator for bm25query equality
+CREATE OPERATOR @extschema@.= (
+    LEFTARG = @extschema@.bm25query,
+    RIGHTARG = @extschema@.bm25query,
+    FUNCTION = @extschema@.bm25query_eq,
+    COMMUTATOR = OPERATOR(@extschema@.=),
+    HASHES
+);
+
+-- bm25 operator class for text columns
+-- The planner hook rewrites text <@> text to text <@> bm25query, so we only
+-- need to register the bm25query operator and support function here.
+CREATE OPERATOR CLASS @extschema@.text_bm25_ops
+DEFAULT FOR TYPE text USING bm25 AS
+    OPERATOR    1   @extschema@.<@> (text, @extschema@.bm25query) FOR ORDER BY float_ops,
+    FUNCTION    8   (text, @extschema@.bm25query)   @extschema@.bm25_text_bm25query_score(text, @extschema@.bm25query);
+
+-- BM25 scoring function for text[] <@> bm25query operations
+-- Flattens array elements with spaces, then scores as a single document.
+CREATE FUNCTION @extschema@.bm25_textarray_bm25query_score(
+    left_arr text[], right_query @extschema@.bm25query)
+RETURNS float8
+AS 'MODULE_PATHNAME', 'bm25_textarray_bm25query_score'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 1000;
+
+-- Error stub for text[] <@> text (planner should rewrite to bm25query)
+CREATE FUNCTION @extschema@.bm25_textarray_text_score(text[], text)
+RETURNS float8
+AS 'MODULE_PATHNAME', 'bm25_textarray_text_score'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 1000;
+
+-- <@> operator for text[] <@> bm25query operations
+CREATE OPERATOR @extschema@.<@> (
+    LEFTARG = text[],
+    RIGHTARG = @extschema@.bm25query,
+    PROCEDURE = @extschema@.bm25_textarray_bm25query_score
+);
+
+-- <@> operator for text[] <@> text operations (implicit index resolution)
+CREATE OPERATOR @extschema@.<@> (
+    LEFTARG = text[],
+    RIGHTARG = text,
+    PROCEDURE = @extschema@.bm25_textarray_text_score
+);
+
+-- bm25 operator class for text[] columns
+CREATE OPERATOR CLASS @extschema@.text_array_bm25_ops
+DEFAULT FOR TYPE text[] USING bm25 AS
+    OPERATOR    1   @extschema@.<@> (text[], @extschema@.bm25query)
+                    FOR ORDER BY float_ops,
+    FUNCTION    8   (text[], @extschema@.bm25query)
+                    @extschema@.bm25_textarray_bm25query_score(
+                        text[], @extschema@.bm25query);
+
+-- Phase 6.1c: record LHS operator for multi-col indexes.
+--
+-- Lets the user write `(title, body) <@> to_bm25query('fox')` so the
+-- planner can resolve the correct multi-col BM25 index from the set
+-- of columns referenced on the LHS.  The standalone scoring function
+-- flattens the record's text-like fields and delegates to the
+-- text-LHS scorer; field_weights and field:term grammar only apply
+-- on the index-scan path (rewritten by the planner hook), not on
+-- the seq-scan fallback.
+CREATE FUNCTION @extschema@.bm25_record_bm25query_score(record, @extschema@.bm25query)
+RETURNS float8
+AS 'MODULE_PATHNAME', 'bm25_record_bm25query_score'
+LANGUAGE C STABLE STRICT PARALLEL SAFE COST 1000;
+
+CREATE OPERATOR @extschema@.<@> (
+    LEFTARG = record,
+    RIGHTARG = @extschema@.bm25query,
+    PROCEDURE = @extschema@.bm25_record_bm25query_score
+);
+
+-- Debug function to dump index contents (memtable and segments)
+CREATE FUNCTION @extschema@.bm25_dump_index(text) RETURNS text
+    AS 'MODULE_PATHNAME', 'tp_dump_index'
+    LANGUAGE C STRICT STABLE;
+
+-- Programmatic prefix-query builder. bm25_prefix('foo') is sugar for
+-- to_bm25query('foo*'); the form with index_name resolves the index
+-- at construction time.
+CREATE FUNCTION @extschema@.bm25_prefix(prefix_text text)
+RETURNS @extschema@.bm25query
+AS $fn$
+    SELECT @extschema@.to_bm25query(prefix_text || '*', grammar => true)
+$fn$
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_prefix(prefix_text text, index_name text)
+RETURNS @extschema@.bm25query
+AS $fn$
+    SELECT @extschema@.to_bm25query(prefix_text || '*', index_name, grammar => true)
+$fn$
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+
+-- Phrase builder: bm25_phrase(ARRAY['foo','bar']) → '"foo bar"'.
+-- Tokens are joined with single spaces; whitespace inside individual
+-- tokens is rejected (callers should provide already-split tokens).
+CREATE FUNCTION @extschema@.bm25_phrase(tokens text[])
+RETURNS @extschema@.bm25query
+AS $fn$
+    SELECT CASE
+        WHEN array_length(tokens, 1) IS NULL OR array_length(tokens, 1) = 0
+            THEN @extschema@.to_bm25query('""', grammar => true)
+        ELSE @extschema@.to_bm25query('"' || array_to_string(tokens, ' ') || '"', grammar => true)
+    END
+$fn$
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_phrase(tokens text[], index_name text)
+RETURNS @extschema@.bm25query
+AS $fn$
+    SELECT @extschema@.to_bm25query(
+        '"' || array_to_string(tokens, ' ') || '"',
+        index_name, grammar => true)
+$fn$
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+
+-- Phrase-prefix builder: bm25_phrase_prefix(ARRAY['foo','bar']) →
+-- '"foo bar*"'. The final token gets the trailing '*' marker.
+CREATE FUNCTION @extschema@.bm25_phrase_prefix(tokens text[])
+RETURNS @extschema@.bm25query
+AS $fn$
+    SELECT @extschema@.to_bm25query(
+        '"' || array_to_string(tokens[1:array_length(tokens,1)-1], ' ') ||
+        CASE WHEN array_length(tokens, 1) > 1 THEN ' ' ELSE '' END ||
+        tokens[array_length(tokens, 1)] || '*"', grammar => true)
+$fn$
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_phrase_prefix(tokens text[], index_name text)
+RETURNS @extschema@.bm25query
+AS $fn$
+    SELECT @extschema@.to_bm25query(
+        '"' || array_to_string(tokens[1:array_length(tokens,1)-1], ' ') ||
+        CASE WHEN array_length(tokens, 1) > 1 THEN ' ' ELSE '' END ||
+        tokens[array_length(tokens, 1)] || '*"',
+        index_name, grammar => true)
+$fn$
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+
+-- Highlighting helpers. Positions are byte offsets represented as
+-- half-open int4range values: [start_byte, end_byte).
+CREATE FUNCTION @extschema@.bm25_snippet(
+    document text,
+    query @extschema@.bm25query,
+    index_name text DEFAULT NULL,
+    start_tag text DEFAULT '<b>',
+    end_tag text DEFAULT '</b>',
+    max_num_chars int DEFAULT 150,
+    "limit" int DEFAULT NULL,
+    "offset" int DEFAULT 0,
+    field_name text DEFAULT NULL)
+RETURNS text
+AS 'MODULE_PATHNAME', 'bm25_snippet'
+LANGUAGE C STABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_snippet(
+    document text,
+    query_text text,
+    index_name text,
+    start_tag text DEFAULT '<b>',
+    end_tag text DEFAULT '</b>',
+    max_num_chars int DEFAULT 150,
+    "limit" int DEFAULT NULL,
+    "offset" int DEFAULT 0,
+    field_name text DEFAULT NULL)
+RETURNS text
+AS 'MODULE_PATHNAME', 'bm25_snippet_text'
+LANGUAGE C STABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_snippet_positions(
+    document text,
+    query @extschema@.bm25query,
+    index_name text DEFAULT NULL,
+    "limit" int DEFAULT NULL,
+    "offset" int DEFAULT 0,
+    field_name text DEFAULT NULL)
+RETURNS int4range[]
+AS 'MODULE_PATHNAME', 'bm25_snippet_positions'
+LANGUAGE C STABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_snippet_positions(
+    document text,
+    query_text text,
+    index_name text,
+    "limit" int DEFAULT NULL,
+    "offset" int DEFAULT 0,
+    field_name text DEFAULT NULL)
+RETURNS int4range[]
+AS 'MODULE_PATHNAME', 'bm25_snippet_positions_text'
+LANGUAGE C STABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_highlights(
+    query @extschema@.bm25query,
+    index_name text,
+    VARIADIC fields text[])
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'bm25_highlights'
+LANGUAGE C STABLE PARALLEL SAFE;
+
+-- Display version info
+DO $$
+BEGIN
+    RAISE INFO 'pg_textsearch v2.0.0';
+END
+$$;
+
+-- Function to force segment write (spill memtable to disk)
+CREATE FUNCTION @extschema@.bm25_spill_index(index_name text)
+RETURNS int4
+AS 'MODULE_PATHNAME', 'tp_spill_memtable'
+LANGUAGE C VOLATILE STRICT;
+
+-- Force-merge all segments into one, à la Lucene's forceMerge(1)
+CREATE FUNCTION @extschema@.bm25_force_merge(index_name text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'tp_force_merge'
+LANGUAGE C VOLATILE STRICT;
+
+-- Preload an index's pages into shared_buffers. Returns page count.
+-- Use after server restart / before a read-heavy workload to avoid
+-- cold-cache latency on the first queries.
+CREATE FUNCTION @extschema@.bm25_prewarm(index_name text)
+RETURNS int8
+AS 'MODULE_PATHNAME', 'tp_prewarm_index'
+LANGUAGE C VOLATILE STRICT;
+
+-- Fast summary function showing only statistics (no content dump)
+CREATE FUNCTION @extschema@.bm25_summarize_index(text) RETURNS text
+    AS 'MODULE_PATHNAME', 'tp_summarize_index'
+    LANGUAGE C STRICT STABLE;
+
+-- Memory usage visibility function.
+-- Intentionally accessible to all users (monitoring/ops use case).
+-- Only exposes aggregate DSA byte counts and configured limits,
+-- not per-index or per-user data.
+CREATE FUNCTION bm25_memory_usage(
+    OUT dsa_total_bytes int8,
+    OUT dsa_total_mb float4,
+    OUT estimated_bytes int8,
+    OUT estimated_mb float4,
+    OUT counter_bytes int8,
+    OUT memory_limit_mb float4,
+    OUT usage_pct float4
+)
+AS 'MODULE_PATHNAME', 'tp_memory_usage'
+LANGUAGE C VOLATILE;
+
+-- Revoke public execute on debug functions (superuser-only).
+REVOKE EXECUTE ON FUNCTION @extschema@.bm25_dump_index(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION @extschema@.bm25_summarize_index(text) FROM PUBLIC;

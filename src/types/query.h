@@ -17,13 +17,16 @@
  *   0: Pre-0.0.6 format with index_name string (no longer supported)
  *   1: 0.0.6+ format with index_oid
  *   2: 0.5.0+ adds explicit_index flag
+ *   3: 2.0.0+ adds fuzzy mode metadata
  */
-#define TPQUERY_VERSION 2
+#define TPQUERY_VERSION 3
 
 /*
  * Flags for TpQuery
  */
 #define TPQUERY_FLAG_EXPLICIT_INDEX 0x01 /* Index was explicitly specified */
+#define TPQUERY_FLAG_FUZZY			0x02 /* Query uses fuzzy expansion */
+#define TPQUERY_FLAG_GRAMMAR		0x04 /* Enable grammar parsing */
 
 /*
  * tpquery data type structure
@@ -37,6 +40,7 @@ typedef struct TpQuery
 	int32 vl_len_;					   /* varlena header (must be first) */
 	uint8 version;					   /* binary format version */
 	uint8 flags;					   /* flags (TPQUERY_FLAG_*) */
+	uint8 fuzzy_max_distance;		   /* valid when TPQUERY_FLAG_FUZZY */
 	Oid	  index_oid;				   /* resolved index OID (InvalidOid if
 										* unresolved) */
 	int32 query_text_len;			   /* length of query text */
@@ -52,9 +56,8 @@ Datum tpquery_out(PG_FUNCTION_ARGS);
 Datum tpquery_recv(PG_FUNCTION_ARGS);
 Datum tpquery_send(PG_FUNCTION_ARGS);
 
-/* Constructor functions */
-Datum to_tpquery_text(PG_FUNCTION_ARGS);
-Datum to_tpquery_text_index(PG_FUNCTION_ARGS);
+/* Constructor function — unified entry point */
+Datum to_tpquery_unified(PG_FUNCTION_ARGS);
 
 /* Operator functions */
 Datum bm25_text_bm25query_score(PG_FUNCTION_ARGS);
@@ -67,9 +70,25 @@ Datum tpquery_eq(PG_FUNCTION_ARGS);
 TpQuery *create_tpquery(const char *query_text, Oid index_oid);
 TpQuery *create_tpquery_explicit(
 		const char *query_text, Oid index_oid, bool explicit_index);
-TpQuery		  *
+TpQuery *create_tpquery_options(
+		const char *query_text,
+		Oid			index_oid,
+		bool		explicit_index,
+		bool		grammar,
+		bool		fuzzy,
+		uint8		fuzzy_max_distance);
+TpQuery *
 create_tpquery_from_name(const char *query_text, const char *index_name);
+TpQuery *create_tpquery_from_name_options(
+		const char *query_text,
+		const char *index_name,
+		bool		grammar,
+		bool		fuzzy,
+		uint8		fuzzy_max_distance);
 Oid	  get_tpquery_index_oid(TpQuery *tpquery);
 char *get_tpquery_text(TpQuery *tpquery);
 bool  tpquery_has_index(TpQuery *tpquery);
 bool  tpquery_is_explicit_index(TpQuery *tpquery);
+bool  tpquery_is_grammar(TpQuery *tpquery);
+bool  tpquery_is_fuzzy(TpQuery *tpquery);
+uint8 tpquery_fuzzy_max_distance(TpQuery *tpquery);

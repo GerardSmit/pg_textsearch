@@ -314,6 +314,7 @@ tp_create_shared_index_state(Oid index_oid, Oid heap_oid)
 	dsa_pointer			  memtable_dp;
 	LocalStateCacheEntry *entry;
 	bool				  found;
+	int					  i;
 
 	/* Get the shared DSA area */
 	dsa = tp_registry_get_dsa();
@@ -341,6 +342,8 @@ tp_create_shared_index_state(Oid index_oid, Oid heap_oid)
 	pg_atomic_init_u32(&shared_state->total_docs, 0);
 	pg_atomic_init_u64(&shared_state->total_len, 0);
 	pg_atomic_init_u64(&shared_state->estimated_bytes, 0);
+	for (i = 0; i < TP_MAX_FIELDS; i++)
+		pg_atomic_init_u64(&shared_state->total_len_per_field[i], 0);
 
 	/*
 	 * Initialize the per-index LWLock using a fixed tranche ID.
@@ -360,7 +363,8 @@ tp_create_shared_index_state(Oid index_oid, Oid heap_oid)
 	pg_atomic_init_u64(&memtable->total_postings, 0);
 	pg_atomic_init_u64(&memtable->num_terms, 0);
 	pg_atomic_init_u64(&memtable->total_term_len, 0);
-	memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	memtable->doc_lengths_handle	   = DSHASH_HANDLE_INVALID;
+	memtable->doc_field_lengths_handle = DSHASH_HANDLE_INVALID;
 
 	shared_state->memtable_dp = memtable_dp;
 
@@ -454,6 +458,11 @@ tp_create_build_index_state(Oid index_oid, Oid heap_oid)
 	shared_state->heap_oid	= heap_oid;
 	pg_atomic_init_u32(&shared_state->total_docs, 0);
 	pg_atomic_init_u64(&shared_state->total_len, 0);
+	{
+		int fi;
+		for (fi = 0; fi < TP_MAX_FIELDS; fi++)
+			pg_atomic_init_u64(&shared_state->total_len_per_field[fi], 0);
+	}
 	shared_state->memtable_dp =
 			InvalidDsaPointer; /* Memtable in private DSA */
 	pg_atomic_init_u64(&shared_state->estimated_bytes, 0);
@@ -504,7 +513,8 @@ tp_create_build_index_state(Oid index_oid, Oid heap_oid)
 	pg_atomic_init_u64(&memtable->total_postings, 0);
 	pg_atomic_init_u64(&memtable->num_terms, 0);
 	pg_atomic_init_u64(&memtable->total_term_len, 0);
-	memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	memtable->doc_lengths_handle	   = DSHASH_HANDLE_INVALID;
+	memtable->doc_field_lengths_handle = DSHASH_HANDLE_INVALID;
 
 	/* Store memtable pointer in shared state for memtable access */
 	shared_state->memtable_dp = memtable_dp;
@@ -577,7 +587,8 @@ tp_recreate_build_dsa(TpLocalIndexState *local_state)
 	pg_atomic_init_u64(&new_memtable->total_postings, 0);
 	pg_atomic_init_u64(&new_memtable->num_terms, 0);
 	pg_atomic_init_u64(&new_memtable->total_term_len, 0);
-	new_memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	new_memtable->doc_lengths_handle	   = DSHASH_HANDLE_INVALID;
+	new_memtable->doc_field_lengths_handle = DSHASH_HANDLE_INVALID;
 
 	/* Update shared state with new memtable pointer */
 	local_state->shared->memtable_dp = memtable_dp;
@@ -640,7 +651,8 @@ tp_finalize_build_mode(TpLocalIndexState *local_state)
 	pg_atomic_init_u64(&memtable->total_postings, 0);
 	pg_atomic_init_u64(&memtable->num_terms, 0);
 	pg_atomic_init_u64(&memtable->total_term_len, 0);
-	memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+	memtable->doc_lengths_handle	   = DSHASH_HANDLE_INVALID;
+	memtable->doc_field_lengths_handle = DSHASH_HANDLE_INVALID;
 
 	/* Update shared state with new memtable pointer */
 	local_state->shared->memtable_dp = memtable_dp;
@@ -821,6 +833,14 @@ tp_cleanup_subxact_abort(SubTransactionId mySubid)
 						dshash_destroy(ht);
 				}
 
+				if (mt->doc_field_lengths_handle != DSHASH_HANDLE_INVALID)
+				{
+					dshash_table *ht = tp_doc_field_length_table_attach(
+							global_dsa, mt->doc_field_lengths_handle);
+					if (ht)
+						dshash_destroy(ht);
+				}
+
 				dsa_free(global_dsa, ls->shared->memtable_dp);
 			}
 		}
@@ -932,6 +952,15 @@ tp_cleanup_index_shared_memory(Oid index_oid)
 				tp_doclength_table_attach(dsa, memtable->doc_lengths_handle);
 		if (doc_lengths_hash != NULL)
 			dshash_destroy(doc_lengths_hash);
+	}
+
+	/* Phase 6.1d: destroy the per-field doc length hash table if any */
+	if (memtable->doc_field_lengths_handle != DSHASH_HANDLE_INVALID)
+	{
+		dshash_table *fl_hash = tp_doc_field_length_table_attach(
+				dsa, memtable->doc_field_lengths_handle);
+		if (fl_hash != NULL)
+			dshash_destroy(fl_hash);
 	}
 
 	/* Subtract estimate from global counter before freeing */
@@ -1290,7 +1319,8 @@ tp_rebuild_posting_lists_from_docids(
 						metap->text_config_oid,
 						local_state,
 						NULL,
-						&doc_length);
+						&doc_length,
+						tp_metapage_field_format(metap, 0));
 			}
 
 			ExecClearTuple(eval_slot);
@@ -1554,6 +1584,16 @@ tp_clear_memtable(TpLocalIndexState *local_state)
 			if (doc_lengths_table)
 				dshash_destroy(doc_lengths_table);
 			memtable->doc_lengths_handle = DSHASH_HANDLE_INVALID;
+		}
+
+		/* Phase 6.1d: destroy the multi-col per-field length table */
+		if (memtable->doc_field_lengths_handle != DSHASH_HANDLE_INVALID)
+		{
+			dshash_table *fl_table = tp_doc_field_length_table_attach(
+					local_state->dsa, memtable->doc_field_lengths_handle);
+			if (fl_table)
+				dshash_destroy(fl_table);
+			memtable->doc_field_lengths_handle = DSHASH_HANDLE_INVALID;
 		}
 
 		/* Reset counters */

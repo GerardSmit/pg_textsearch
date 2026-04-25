@@ -13,6 +13,8 @@
 #include <storage/lwlock.h>
 #include <utils/dsa.h>
 
+#include "constants.h"
+
 /* Forward declarations */
 struct TpMemtable;
 typedef struct TpIndexMetaPageData *TpIndexMetaPage;
@@ -43,6 +45,14 @@ typedef struct TpMemtable
 	/* Document length hash table in DSA */
 	dshash_table_handle doc_lengths_handle; /* Handle for document
 											 * length hash table */
+
+	/*
+	 * Phase 6.1d: per-doc per-field length hash table (multi-col only).
+	 * DSHASH_HANDLE_INVALID for single-col indexes; created lazily
+	 * when the first multi-col insert happens.  Cleared on memtable
+	 * spill alongside doc_lengths_handle.
+	 */
+	dshash_table_handle doc_field_lengths_handle;
 
 	/* Counters for memory estimation (soft limit) */
 	pg_atomic_uint64 num_terms;		 /* Unique terms in string table */
@@ -91,6 +101,14 @@ typedef struct TpSharedIndexState
 	 * generation to detect stale docid page caches.
 	 */
 	pg_atomic_uint64 spill_generation;
+
+	/*
+	 * Per-field length totals for BM25F.  Maintained alongside
+	 * total_len so that query-time per-field avgdl reflects
+	 * unflushed memtable inserts, not just spilled segments.
+	 * Single-col indexes use only [0].
+	 */
+	pg_atomic_uint64 total_len_per_field[TP_MAX_FIELDS];
 } TpSharedIndexState;
 
 /*

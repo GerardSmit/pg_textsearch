@@ -89,3 +89,29 @@ extern void tp_decompress_block(
  * Parses header to compute actual size without decompressing.
  */
 extern uint32 tp_compressed_block_size(const uint8 *compressed, uint32 count);
+
+/*
+ * V7 positions: LEB128-style varint-delta encoding.
+ *
+ * Positions within a doc are strictly monotonic 1-based ordinals
+ * (tsvector guarantees this). We encode the first position as a
+ * varint and each subsequent position as (cur - prev) varint. Most
+ * deltas are 1-3 → 1 byte each; vs 4 bytes/position raw this is a
+ * 3-4× shrink for typical English text.
+ *
+ * tp_positions_max_encoded_bytes(count): worst-case encoded size
+ *   (5 bytes per uint32). Use for buffer sizing.
+ *
+ * tp_positions_encode_varint_delta: encodes count positions from
+ *   positions[] into out[]. Returns bytes written.
+ *
+ * tp_positions_decode_varint_delta: reads exactly count positions
+ *   from in[0..in_len-1] into out[]. Returns bytes consumed.
+ *   Raises ERROR if the stream is truncated, contains overlong
+ *   varints, or exceeds in_len.
+ */
+extern uint32 tp_positions_max_encoded_bytes(uint32 count);
+extern uint32 tp_positions_encode_varint_delta(
+		const uint32 *positions, uint32 count, uint8 *out);
+extern uint32 tp_positions_decode_varint_delta(
+		const uint8 *in, uint32 in_len, uint32 count, uint32 *out);

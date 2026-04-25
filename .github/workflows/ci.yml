@@ -40,7 +40,7 @@ jobs:
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }}
+        sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }} libxml2-dev pkg-config
 
     - name: Install TimescaleDB
       run: |
@@ -53,7 +53,7 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        sudo apt-get install -y build-essential bc
+        sudo apt-get install -y build-essential libxml2-dev pkg-config bc
 
     - name: Start PostgreSQL
       run: |
@@ -185,11 +185,11 @@ jobs:
     - name: Install PostgreSQL and build tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget ca-certificates build-essential bc
+        sudo apt-get install -y wget ca-certificates build-essential libxml2-dev pkg-config bc
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-${{ matrix.config.pg_version }} postgresql-server-dev-${{ matrix.config.pg_version }}
+        sudo apt-get install -y postgresql-${{ matrix.config.pg_version }} postgresql-server-dev-${{ matrix.config.pg_version }} libxml2-dev pkg-config
 
     - name: Build with ${{ matrix.config.cc }}
       run: |
@@ -207,11 +207,11 @@ jobs:
     - name: Install PostgreSQL 17
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget ca-certificates build-essential bc
+        sudo apt-get install -y wget ca-certificates build-essential libxml2-dev pkg-config bc
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+        sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libxml2-dev pkg-config
 
     - name: Start PostgreSQL
       run: |
@@ -303,7 +303,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y flex bison build-essential libssl-dev \
-          libreadline-dev systemd-coredump gdb ${{ env.extra_packages }}
+          libreadline-dev libxml2-dev pkg-config systemd-coredump gdb ${{ env.extra_packages }}
 
     - name: Checkout
       uses: actions/checkout@v4
@@ -490,7 +490,7 @@ jobs:
         wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/postgresql-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
         sudo apt-get update
-        sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+        sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libxml2-dev pkg-config
 
     - name: Install TimescaleDB
       run: |
@@ -501,7 +501,7 @@ jobs:
 
     - name: Install coverage tools
       run: |
-        sudo apt-get install -y lcov build-essential bc
+        sudo apt-get install -y lcov build-essential libxml2-dev pkg-config bc
 
     - name: Build extension with coverage instrumentation
       run: |

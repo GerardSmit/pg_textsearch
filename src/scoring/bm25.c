@@ -10,6 +10,7 @@
 #include <storage/itemptr.h>
 #include <utils/memutils.h>
 
+#include "constants.h"
 #include "index/metapage.h"
 #include "index/state.h"
 #include "memtable/memtable.h"
@@ -36,7 +37,7 @@ tp_calculate_idf(int32 doc_freq, int32 total_docs)
  * Get unified doc_freq for a term (memtable + all segments).
  * Returns 0 if term not found in any source.
  */
-static uint32
+uint32
 tp_get_unified_doc_freq(
 		TpLocalIndexState *local_state,
 		Relation		   index,
@@ -108,11 +109,12 @@ tp_batch_get_unified_doc_freq(
  * Returns number of documents scored
  */
 int
-tp_score_documents(
+tp_score_documents_weighted(
 		TpLocalIndexState *local_state,
 		Relation		   index_relation,
 		char			 **query_terms,
 		int32			  *query_frequencies,
+		float4			  *query_term_weights,
 		int				   query_term_count,
 		float4			   k1,
 		float4			   b,
@@ -124,6 +126,8 @@ tp_score_documents(
 	int32			total_docs;
 	TpIndexMetaPage metap;
 	BlockNumber		level_heads[TP_MAX_LEVELS];
+	float4			field_weights[TP_MAX_FIELDS];
+	float4			field_avgdls[TP_MAX_FIELDS]; /* BM25F: per-field */
 	int				i;
 
 	/* Basic sanity checks */
@@ -155,6 +159,21 @@ tp_score_documents(
 	metap = tp_get_metapage(index_relation);
 	for (i = 0; i < TP_MAX_LEVELS; i++)
 		level_heads[i] = metap->level_heads[i];
+	memcpy(field_weights, metap->field_weights, sizeof(field_weights));
+	for (i = 0; i < TP_MAX_FIELDS; i++)
+	{
+		/*
+		 * Use live per-field totals from shared atomics so unflushed
+		 * memtable inserts are reflected in BM25F scoring.
+		 */
+		uint64 live_total = pg_atomic_read_u64(
+				&local_state->shared->total_len_per_field[i]);
+		if (live_total > 0 && total_docs > 0)
+			field_avgdls[i] = (float4)((double)live_total /
+									   (double)total_docs);
+		else
+			field_avgdls[i] = tp_metapage_field_avgdl(metap, i, avg_doc_len);
+	}
 	pfree(metap);
 
 	/* If avg_doc_len is 0, all documents have zero length and
@@ -172,6 +191,7 @@ tp_score_documents(
 		uint32		doc_freq;
 		float4		idf;
 		float4	   *scores;
+		float4		term_avgdl = avg_doc_len;
 		int			result_count;
 		TpBMWStats	stats;
 
@@ -181,8 +201,23 @@ tp_score_documents(
 		if (doc_freq == 0)
 			return 0;
 
-		/* Calculate IDF */
+		/* Calculate IDF, then apply per-field weight if term is tagged */
 		idf = tp_calculate_idf(doc_freq, total_docs);
+		idf *= tp_term_field_weight(term, field_weights);
+		if (query_term_weights != NULL)
+			idf *= query_term_weights[0];
+
+		/* BM25F: per-field avgdl for tagged terms */
+		{
+			unsigned char first = (unsigned char)term[0];
+			if (first >= TP_FIELD_TAG_BASE)
+			{
+				int fidx = first - TP_FIELD_TAG_BASE;
+				if (fidx >= 0 && fidx < TP_MAX_FIELDS &&
+					field_avgdls[fidx] > 0.0f)
+					term_avgdl = field_avgdls[fidx];
+			}
+		}
 
 		/* Allocate scores array */
 		scores = (float4 *)palloc(max_results * sizeof(float4));
@@ -195,7 +230,7 @@ tp_score_documents(
 				idf,
 				k1,
 				b,
-				avg_doc_len,
+				term_avgdl,
 				max_results,
 				result_ctids,
 				scores,
@@ -246,13 +281,35 @@ tp_score_documents(
 				level_heads,
 				doc_freqs);
 
-		/* Convert doc_freqs to IDFs */
-		idfs = palloc(query_term_count * sizeof(float4));
+		float4 *avgdls;
+
+		/* Convert doc_freqs to IDFs, scaled by per-field weight */
+		idfs   = palloc(query_term_count * sizeof(float4));
+		avgdls = palloc(query_term_count * sizeof(float4));
 		for (i = 0; i < query_term_count; i++)
 		{
-			idfs[i] = (doc_freqs[i] > 0)
-							? tp_calculate_idf(doc_freqs[i], total_docs)
-							: 0.0f;
+			unsigned char first;
+
+			if (doc_freqs[i] > 0)
+			{
+				idfs[i] = tp_calculate_idf(doc_freqs[i], total_docs);
+				idfs[i] *= tp_term_field_weight(query_terms[i], field_weights);
+				if (query_term_weights != NULL)
+					idfs[i] *= query_term_weights[i];
+			}
+			else
+				idfs[i] = 0.0f;
+
+			/* BM25F: per-term avgdl (field-specific when tagged) */
+			avgdls[i] = avg_doc_len;
+			first	  = (unsigned char)query_terms[i][0];
+			if (first >= TP_FIELD_TAG_BASE)
+			{
+				int fidx = first - TP_FIELD_TAG_BASE;
+				if (fidx >= 0 && fidx < TP_MAX_FIELDS &&
+					field_avgdls[fidx] > 0.0f)
+					avgdls[i] = field_avgdls[fidx];
+			}
 		}
 		pfree(doc_freqs);
 
@@ -267,6 +324,7 @@ tp_score_documents(
 				query_term_count,
 				query_frequencies,
 				idfs,
+				avgdls,
 				k1,
 				b,
 				avg_doc_len,
@@ -276,6 +334,7 @@ tp_score_documents(
 				&stats);
 
 		pfree(idfs);
+		pfree(avgdls);
 
 		/* Log BMW stats if enabled */
 		if (tp_log_bmw_stats)
@@ -300,4 +359,31 @@ tp_score_documents(
 		*result_scores = scores;
 		return result_count;
 	}
+}
+
+int
+tp_score_documents(
+		TpLocalIndexState *local_state,
+		Relation		   index_relation,
+		char			 **query_terms,
+		int32			  *query_frequencies,
+		int				   query_term_count,
+		float4			   k1,
+		float4			   b,
+		int				   max_results,
+		ItemPointer		   result_ctids,
+		float4			 **result_scores)
+{
+	return tp_score_documents_weighted(
+			local_state,
+			index_relation,
+			query_terms,
+			query_frequencies,
+			NULL,
+			query_term_count,
+			k1,
+			b,
+			max_results,
+			result_ctids,
+			result_scores);
 }

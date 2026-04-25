@@ -1,0 +1,13 @@
+.git
+test/results
+test/regression.diffs
+test/regression.out
+tmp_check_shared
+coverage-html
+coverage.info
+*.gcda
+*.gcno
+*.o
+*.bc
+*.so
+benchmarks/datasets

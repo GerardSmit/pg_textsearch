@@ -21,6 +21,7 @@
 #include <storage/itemptr.h>
 #include <utils/hsearch.h>
 
+#include "constants.h"
 #include "memtable/arena.h"
 #include "memtable/expull.h"
 #include "segment/segment.h"
@@ -29,12 +30,25 @@
  * Hash table entry for one term during index build.
  * The term string is stored in the arena; the HTAB key
  * is a pointer to it.
+ *
+ * positions, when non-NULL, is a flat palloc'd uint32 stream
+ * holding the concatenated 1-based positions of every (doc, occurrence)
+ * pair for this term, in posting insertion order. Per-doc count is
+ * the corresponding posting's `frequency` field, so the reader
+ * iterates postings and slices off `frequency` uint32s per posting.
+ *
+ * Positions are nullable per term — a term whose first appended doc
+ * had no positions stays positions=NULL forever (mixed positions vs.
+ * no-positions in the same term is not supported in this iteration).
  */
 typedef struct TpBuildTermEntry
 {
 	char	*term; /* Key: pointer to arena-stored null-terminated string */
 	uint32	 term_len;
-	TpExpull expull; /* Inline EXPULL posting list header */
+	TpExpull expull;		  /* Inline EXPULL posting list header */
+	uint32	*positions;		  /* Flat uint32 stream, palloc'd; or NULL */
+	uint32	 positions_count; /* uint32s in positions */
+	uint32	 positions_capacity;
 } TpBuildTermEntry;
 
 /*
@@ -55,13 +69,23 @@ typedef struct TpBuildContext
 	HTAB *terms_ht;
 
 	/* Flat arrays indexed by doc_id (sequential assignment) */
-	uint8			*fieldnorms; /* Encoded fieldnorm per doc */
+	uint8			*fieldnorms; /* Encoded total fieldnorm per doc (1 byte) */
 	ItemPointerData *ctids;		 /* Heap CTID per doc */
 	uint32			 num_docs;	 /* Documents in current batch */
 	uint32			 docs_capacity;
 
+	/*
+	 * Phase 6.1d: per-field fieldnorm table.  NULL for single-col
+	 * builds; allocated on tp_build_context_set_num_fields(num > 1).
+	 * Indexed field_fieldnorms[doc_id * num_fields + f].
+	 */
+	uint8 *field_fieldnorms;
+	int	   num_fields;
+
 	/* Corpus statistics for this batch */
 	uint64 total_len; /* Sum of document lengths */
+	/* Phase 6.1d: per-field token sum for this batch */
+	uint64 total_len_per_field[TP_MAX_FIELDS];
 
 	/* Budget for flush decisions */
 	Size budget; /* Max arena bytes before flush */
@@ -85,13 +109,50 @@ extern TpBuildContext *tp_build_context_create(Size budget);
  *
  * Returns the assigned doc_id.
  */
+/*
+ * positions, when non-NULL, is a parallel array of palloc'd uint32
+ * arrays of length frequencies[i]; each holds the 1-based positions
+ * of that term's occurrences in this doc. Per-element NULL is
+ * tolerated (term gets recorded without positions). When positions
+ * is NULL altogether, no positions are captured for this doc.
+ */
 extern uint32 tp_build_context_add_document(
 		TpBuildContext *ctx,
 		char		  **terms,
 		int32		   *frequencies,
+		uint32		  **positions,
 		int				term_count,
 		int32			doc_length,
 		ItemPointer		ctid);
+
+/*
+ * Phase 6.1d: multi-col variant.  field_lengths[f] is the length of
+ * column f in this doc; num_fields is the array size.  Caller must
+ * have called tp_build_context_set_num_fields() with the same
+ * num_fields first.  When ctx has num_fields > 1 and a tagged term
+ * is appended, the EXPULL entry's inline fieldnorm is set to the
+ * per-field length (not the total) so segment scoring reads BM25F-
+ * normalized lengths.
+ */
+extern uint32 tp_build_context_add_document_multi(
+		TpBuildContext *ctx,
+		char		  **terms,
+		int32		   *frequencies,
+		uint32		  **positions,
+		int				term_count,
+		int32			doc_length,
+		const int32	   *field_lengths,
+		int				num_fields,
+		ItemPointer		ctid);
+
+/*
+ * Phase 6.1d: enable per-field fieldnorm tracking.  Allocates the
+ * field_fieldnorms[] array sized for the current docs_capacity.
+ * Must be called before any add_document calls and before finalize.
+ * num_fields <= 1 is a no-op.
+ */
+extern void
+tp_build_context_set_num_fields(TpBuildContext *ctx, int num_fields);
 
 /*
  * Check if the build context should be flushed (budget exceeded).
@@ -118,8 +179,10 @@ typedef struct TpBuildTermInfo
 {
 	char	 *term;
 	uint32	  term_len;
-	TpExpull *expull;	/* Points into HTAB entry */
-	uint32	  doc_freq; /* Number of documents for this term */
+	TpExpull *expull;		   /* Points into HTAB entry */
+	uint32	  doc_freq;		   /* Number of documents for this term */
+	uint32	 *positions;	   /* Borrowed pointer into HTAB entry (or NULL) */
+	uint32	  positions_count; /* uint32s in positions stream */
 } TpBuildTermInfo;
 
 extern TpBuildTermInfo *

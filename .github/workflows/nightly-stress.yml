@@ -61,7 +61,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y flex bison build-essential libssl-dev \
-          libreadline-dev clang-15 llvm-15 bc
+          libreadline-dev libxml2-dev pkg-config clang-15 llvm-15 bc
 
     - name: Checkout
       uses: actions/checkout@v4

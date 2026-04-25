@@ -42,6 +42,11 @@ relopt_kind tp_relopt_kind;
 
 /* External variable from limits module */
 extern int tp_default_limit;
+extern int tp_max_prefix_expansions;
+extern int tp_phrase_candidate_overfetch;
+extern int tp_max_fuzzy_expansions;
+extern int tp_max_fuzzy_distance;
+extern int tp_min_fuzzy_term_len;
 
 /* Library version string for stale binary detection */
 static char *tp_library_version = NULL;
@@ -236,6 +241,86 @@ _PG_init(void)
 			NULL,
 			NULL);
 
+	DefineCustomIntVariable(
+			"pg_textsearch.max_prefix_expansions",
+			"Cap on terms a single prefix query can expand to",
+			"When a query contains a prefix term (e.g. 'foo*'), the index "
+			"dictionary is scanned for matching terms and each match is "
+			"OR'd into the resulting query. This GUC caps the total number "
+			"of expansions per prefix to prevent runaway fan-out on very "
+			"common prefixes.",
+			&tp_max_prefix_expansions,
+			50, /* default */
+			1,	/* min */
+			100000,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomIntVariable(
+			"pg_textsearch.max_fuzzy_expansions",
+			"Cap on terms a single fuzzy query token can expand to",
+			"Fuzzy query tokens are expanded against the indexed dictionary. "
+			"This GUC caps the number of concrete terms emitted per token.",
+			&tp_max_fuzzy_expansions,
+			50,
+			1,
+			100000,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomIntVariable(
+			"pg_textsearch.max_fuzzy_distance",
+			"Maximum edit distance accepted by bm25_fuzzy",
+			"bm25_fuzzy(..., max_distance) errors when max_distance exceeds "
+			"this value.",
+			&tp_max_fuzzy_distance,
+			2,
+			1,
+			4,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomIntVariable(
+			"pg_textsearch.min_fuzzy_term_len",
+			"Minimum normalized token length for fuzzy expansion",
+			"Shorter tokens are resolved exactly to avoid noisy and expensive "
+			"fuzzy expansions.",
+			&tp_min_fuzzy_term_len,
+			3,
+			1,
+			64,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomIntVariable(
+			"pg_textsearch.phrase_candidate_overfetch",
+			"Top-K multiplier when generating BMW candidates for phrase "
+			"queries",
+			"Phrase queries verify each candidate doc by re-tokenizing the "
+			"heap row to read positions. Higher values catch more rare "
+			"phrases at the cost of extra heap fetches per query.",
+			&tp_phrase_candidate_overfetch,
+			4,
+			1,
+			1000,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
 	DefineCustomBoolVariable(
 			"pg_textsearch.compress_segments",
 			"Enable compression for new segment blocks",
@@ -295,6 +380,24 @@ _PG_init(void)
 			TP_DEFAULT_B,
 			0.0,
 			1.0,
+			NoLock);
+	add_string_reloption(
+			tp_relopt_kind,
+			"field_weights",
+			"Per-field BM25 weight multipliers (comma-separated, one per "
+			"indexed column). Example: '3.0,1.0' boosts matches in the "
+			"first column 3× relative to the second.",
+			NULL,
+			NULL,
+			NoLock);
+	add_string_reloption(
+			tp_relopt_kind,
+			"content_format",
+			"Per-field content format: 'plain' (default), 'html', "
+			"or 'markdown'. A bare value applies to all columns; "
+			"per-field: 'title:plain,body:markdown'.",
+			NULL,
+			NULL,
 			NoLock);
 
 	/*

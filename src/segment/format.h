@@ -37,106 +37,55 @@ typedef struct TpPageIndexSpecial
 } TpPageIndexSpecial;
 
 /*
- * Segment format versions
+ * Segment format version.  Clean-slate format; pre-2.0 segments are
+ * not readable and require REINDEX.  Version 2 adds fuzzy-term metadata.
+ * Position data is encoded as varint-delta (see TpPositionsIndexEntry below).
  */
-#define TP_SEGMENT_FORMAT_VERSION_3 3 /* Legacy: uint32 offsets */
-#define TP_SEGMENT_FORMAT_VERSION_4 4 /* Legacy: no alive bitset */
-#define TP_SEGMENT_FORMAT_VERSION	5 /* Current: alive bitset */
+#define TP_SEGMENT_FORMAT_VERSION 2
 
-/*
- * V3 legacy segment header - preserved for reading old segments.
- * All offsets are uint32, limiting segments to 4GB.
- */
-typedef struct TpSegmentHeaderV3
-{
-	uint32		magic;
-	uint32		version;
-	TimestampTz created_at;
-	uint32		num_pages;
-	uint32		data_size;
-	uint32		level;
-	BlockNumber next_segment;
-	uint32		dictionary_offset;
-	uint32		strings_offset;
-	uint32		entries_offset;
-	uint32		postings_offset;
-	uint32		skip_index_offset;
-	uint32		fieldnorm_offset;
-	uint32		ctid_pages_offset;
-	uint32		ctid_offsets_offset;
-	uint32		num_terms;
-	uint32		num_docs;
-	uint64		total_tokens;
-	BlockNumber page_index;
-} TpSegmentHeaderV3;
-
-/*
- * V4 legacy segment header - preserved for reading old segments.
- * Same as V5 but without alive_bitset_offset / alive_count.
- */
-typedef struct TpSegmentHeaderV4
+typedef struct TpSegmentHeader
 {
 	uint32		magic;
 	uint32		version;
 	TimestampTz created_at;
 	uint32		num_pages;
 	uint64		data_size;
+
 	uint32		level;
 	BlockNumber next_segment;
-	uint64		dictionary_offset;
-	uint64		strings_offset;
-	uint64		entries_offset;
-	uint64		postings_offset;
-	uint64		skip_index_offset;
-	uint64		fieldnorm_offset;
-	uint64		ctid_pages_offset;
-	uint64		ctid_offsets_offset;
-	uint32		num_terms;
-	uint32		num_docs;
-	uint64		total_tokens;
+
+	uint64 dictionary_offset;
+	uint64 strings_offset;
+	uint64 entries_offset;
+	uint64 postings_offset;
+
+	uint64 skip_index_offset;
+	uint64 fieldnorm_offset;
+	uint64 ctid_pages_offset;
+	uint64 ctid_offsets_offset;
+
+	uint64 alive_bitset_offset;
+	uint32 alive_count;
+
+	uint32 num_terms;
+	uint32 num_docs;
+	uint64 total_tokens;
+
 	BlockNumber page_index;
-} TpSegmentHeaderV4;
 
-/*
- * Segment header - stored on the first page (V5: alive bitset)
- */
-typedef struct TpSegmentHeader
-{
-	/* Metadata */
-	uint32		magic;		/* TP_SEGMENT_MAGIC */
-	uint32		version;	/* Format version */
-	TimestampTz created_at; /* Creation time */
-	uint32		num_pages;	/* Total pages in segment */
-	uint64		data_size;	/* Total data bytes */
+	uint64 positions_offset; /* 0 when no positions section */
+	uint64 positions_size;	 /* Bytes in the positions section */
 
-	/* Segment management */
-	uint32		level;		  /* Storage level (0 for memtable flush) */
-	BlockNumber next_segment; /* Next segment in chain */
-
-	/* Section offsets in logical file */
-	uint64 dictionary_offset; /* Offset to TpDictionary */
-	uint64 strings_offset;	  /* Offset to string pool */
-	uint64 entries_offset;	  /* Offset to TpDictEntry array */
-	uint64 postings_offset;	  /* Offset to posting data (blocks) */
-
-	/* Block storage offsets */
-	uint64 skip_index_offset;	/* Offset to skip index */
-	uint64 fieldnorm_offset;	/* Offset to fieldnorm table */
-	uint64 ctid_pages_offset;	/* Offset to BlockNumber array */
-	uint64 ctid_offsets_offset; /* Offset to OffsetNumber array */
-
-	/* Alive bitset for tombstone tracking (V5+) */
-	uint64 alive_bitset_offset; /* Offset to alive bitset data */
-	uint32 alive_count;			/* Number of alive docs (bits set) */
-
-	/* Corpus statistics */
-	uint32 num_terms;	 /* Total unique terms */
-	uint32 num_docs;	 /* Total documents */
-	uint64 total_tokens; /* Sum of all document lengths */
-
-	/* Page index reference */
-	BlockNumber page_index; /* First page of the page index */
+	uint64 fuzzy_index_offset; /* 0 when no fuzzy metadata section */
+	uint64 fuzzy_index_size;   /* Bytes in the fuzzy metadata section */
 } TpSegmentHeader;
+
+typedef struct TpFuzzyTermMeta
+{
+	uint32 lexical_chars; /* term length excluding field tag, in UTF-8 chars */
+	uint8  field_tag; /* 0 for untagged, otherwise TP_FIELD_TAG_BASE + idx */
+	uint8  reserved[3];
+} TpFuzzyTermMeta;
 
 /*
  * Dictionary structure for fast term lookup
@@ -172,28 +121,11 @@ typedef struct TpStringEntry
 } TpStringEntry;
 
 /*
- * V3 legacy dictionary entry - 12 bytes
- */
-typedef struct TpDictEntryV3
-{
-	uint32 skip_index_offset;
-	uint16 block_count;
-	uint16 reserved;
-	uint32 doc_freq;
-} __attribute__((aligned(4))) TpDictEntryV3;
-
-/*
- * Dictionary entry - 16 bytes, block-based storage (V4: uint64 offset)
+ * Dictionary entry - 16 bytes, block-based storage.
  *
- * Points to skip index instead of raw postings. The skip index
- * contains block_count TpSkipEntry structures, each pointing to
- * a block of up to TP_BLOCK_SIZE postings.
- *
- * block_count was widened from uint16 to uint32 without a format
- * version bump.  The old layout had uint16 block_count + uint16
- * reserved (always 0) at bytes 8-11.  On little-endian platforms
- * (x86-64, ARM64) these four bytes read identically as a uint32,
- * so existing V4 segments are binary-compatible.
+ * Points to a skip index containing block_count TpSkipEntry
+ * structures, each describing a block of up to TP_BLOCK_SIZE
+ * postings.
  */
 typedef struct TpDictEntry
 {
@@ -203,26 +135,60 @@ typedef struct TpDictEntry
 } __attribute__((aligned(8))) TpDictEntry;
 
 /*
+ * Per-term entry in the positions index.  The positions section
+ * starts with a TpPositionsIndexEntry[num_terms] array followed by
+ * the concatenated per-term position streams.  Each stream is
+ * varint-delta: first position as a varint, subsequent positions as
+ * varint deltas (always >= 1, tsvector positions are strictly
+ * monotonic within a doc).  A reader walks postings; for each
+ * posting with frequency F, reads F varints advancing a byte cursor.
+ *
+ * positions_byte_offset is relative to the start of the positions
+ * data area (positions_offset + sizeof(TpPositionsIndexEntry) *
+ * num_terms).  positions_byte_length encodes:
+ *
+ *   bits 0..62 — actual byte length for this term's data
+ *   bit 63     — encoding flag (always 1 in this format).  Kept as a
+ *                sanity bit so corrupted streams that read length 0
+ *                or all-bits-set are still detectable.
+ */
+#define TP_POS_ENCODING_FLAG_BIT ((uint64)1 << 63)
+#define TP_POS_ENCODING_MASK	 ((uint64)1 << 63)
+#define TP_POS_LENGTH_MASK		 ((uint64)(~TP_POS_ENCODING_MASK))
+
+static inline bool
+tp_pos_is_varint(uint64 byte_length_raw)
+{
+	return (byte_length_raw & TP_POS_ENCODING_FLAG_BIT) != 0;
+}
+
+static inline uint64
+tp_pos_length(uint64 byte_length_raw)
+{
+	return byte_length_raw & TP_POS_LENGTH_MASK;
+}
+
+static inline uint64
+tp_pos_encode_length(uint64 actual_length, bool is_varint)
+{
+	return (actual_length & TP_POS_LENGTH_MASK) |
+		   (is_varint ? TP_POS_ENCODING_FLAG_BIT : 0);
+}
+
+typedef struct TpPositionsIndexEntry
+{
+	uint64 positions_byte_offset; /* relative to positions data start */
+	uint64 positions_byte_length; /* low 63 bits: length; high bit: varint flag
+								   */
+} TpPositionsIndexEntry;
+
+/*
  * Block storage constants
  */
 #define TP_BLOCK_SIZE 128 /* Documents per block (matches Tantivy) */
 
 /*
- * V3 legacy skip index entry - 16 bytes per block
- */
-typedef struct TpSkipEntryV3
-{
-	uint32 last_doc_id;
-	uint8  doc_count;
-	uint16 block_max_tf;
-	uint8  block_max_norm;
-	uint32 posting_offset;
-	uint8  flags;
-	uint8  reserved[3];
-} __attribute__((packed)) TpSkipEntryV3;
-
-/*
- * Skip index entry - 20 bytes per block (V4: uint64 posting_offset)
+ * Skip index entry - 20 bytes per block.
  *
  * Stored separately from posting data for cache efficiency during BMW.
  * The skip index is a dense array of these entries, one per block.

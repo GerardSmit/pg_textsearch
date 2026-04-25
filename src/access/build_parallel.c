@@ -46,6 +46,7 @@
 #include "segment/pagemapper.h"
 #include "segment/segment.h"
 #include "types/array.h"
+#include "types/markup.h"
 
 /* ----------------------------------------------------------------
  * Worker-local segment tracking
@@ -283,6 +284,7 @@ tp_parallel_build_worker_main(dsm_segment *seg, shm_toc *toc)
 		TSVector	tsvector;
 		char	  **terms;
 		int32	   *frequencies;
+		uint32	  **positions = NULL;
 		int			term_count;
 		int			doc_length;
 
@@ -314,6 +316,9 @@ tp_parallel_build_worker_main(dsm_segment *seg, shm_toc *toc)
 		else
 			document_text = DatumGetTextPP(idx_values[0]);
 
+		document_text = tp_normalize_markup(
+				document_text, (TpContentFormat)shared->field_formats[0]);
+
 		tsvector_datum = DirectFunctionCall2Coll(
 				to_tsvector_byid,
 				InvalidOid,
@@ -322,7 +327,7 @@ tp_parallel_build_worker_main(dsm_segment *seg, shm_toc *toc)
 		tsvector = DatumGetTSVector(tsvector_datum);
 
 		doc_length = tp_extract_terms_from_tsvector(
-				tsvector, &terms, &frequencies, &term_count);
+				tsvector, &terms, &frequencies, &positions, &term_count);
 
 		MemoryContextSwitchTo(oldctx);
 
@@ -332,6 +337,7 @@ tp_parallel_build_worker_main(dsm_segment *seg, shm_toc *toc)
 					build_ctx,
 					terms,
 					frequencies,
+					positions,
 					term_count,
 					doc_length,
 					ctid);
@@ -470,14 +476,15 @@ tp_parallel_build_worker_main(dsm_segment *seg, shm_toc *toc)
  */
 IndexBuildResult *
 tp_build_parallel(
-		Relation   heap,
-		Relation   index,
-		IndexInfo *indexInfo,
-		Oid		   text_config_oid,
-		double	   k1,
-		double	   b,
-		bool	   is_text_array,
-		int		   nworkers)
+		Relation	 heap,
+		Relation	 index,
+		IndexInfo	*indexInfo,
+		Oid			 text_config_oid,
+		double		 k1,
+		double		 b,
+		bool		 is_text_array,
+		int			 nworkers,
+		const uint8 *field_formats)
 {
 	IndexBuildResult	  *result;
 	ParallelContext		  *pcxt;
@@ -540,6 +547,11 @@ tp_build_parallel(
 			b,
 			is_text_array,
 			nworkers);
+
+	if (field_formats != NULL)
+		memcpy(shared->field_formats,
+			   field_formats,
+			   sizeof(shared->field_formats));
 
 	/* Initialize SharedFileSet for worker temp files */
 	SharedFileSetInit(&shared->fileset, pcxt->seg);

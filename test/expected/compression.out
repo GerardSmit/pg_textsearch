@@ -1,7 +1,7 @@
 -- Test compression functionality
 -- Tests that compression (now default) produces correct results
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v1.1.0
+INFO:  pg_textsearch v2.0.0
 -- Compression is now on by default
 SHOW pg_textsearch.compress_segments;
  pg_textsearch.compress_segments 
@@ -72,7 +72,7 @@ FROM generate_series(1, 100) AS i;
 SELECT bm25_spill_index('compression_idx');
  bm25_spill_index 
 ------------------
-                6
+                7
 (1 row)
 
 -- Query across both segments
@@ -222,7 +222,7 @@ FROM generate_series(301, 450) AS i;
 SELECT bm25_spill_index('mixed_idx');
  bm25_spill_index 
 ------------------
-               10
+               11
 (1 row)
 
 -- Now we have: compressed segment, uncompressed segment, compressed segment
@@ -269,7 +269,7 @@ FROM generate_series(151, 300) AS i;
 SELECT bm25_spill_index('mixed_idx2');
  bm25_spill_index 
 ------------------
-                6
+                7
 (1 row)
 
 -- Query across uncompressed and compressed segments

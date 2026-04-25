@@ -23,6 +23,7 @@
 #include <libpq/pqformat.h>
 #include <nodes/pg_list.h>
 #include <nodes/value.h>
+#include <stdlib.h>
 #include <tsearch/ts_type.h>
 #include <utils/builtins.h>
 #include <utils/fmgroids.h>
@@ -41,12 +42,45 @@
 #include "memtable/posting.h"
 #include "planner/hooks.h"
 #include "scoring/bm25.h"
+#include "scoring/phrase.h"
 #include "segment/fieldnorm.h"
 #include "segment/io.h"
 #include "segment/segment.h"
 #include "types/array.h"
+#include "types/markup.h"
 #include "types/query.h"
+#include "types/query_parser.h"
 #include "types/vector.h"
+
+/*
+ * Phase 6.1d: per-field standalone BM25F context.
+ *
+ * The text-LHS scorer (`bm25_text_bm25query_score`) takes one text arg.
+ * For multi-col indexes the existing flattening loses the per-column
+ * boundary, so a tagged term `title:foo` got scored against the
+ * concatenated tsvector and total doc length — directionally right
+ * but not exact BM25F.
+ *
+ * The record-LHS scorer (`bm25_record_bm25query_score`) has access to
+ * every column via the deformed tuple.  It tokenizes each text-like
+ * column separately, stashes the resulting per-field tsvectors and
+ * fieldnorm-quantized lengths in this context, then delegates to the
+ * text scorer.  When the scorer's grammar path encounters a tagged
+ * term, it pulls tf and doc length from this context's per-field
+ * tsvector instead of the flattened-text tsvector.
+ *
+ * Backend-local static.  Saved/restored around the inner call so
+ * recursive scoring (rare) doesn't clobber outer state.
+ */
+typedef struct TpBm25fDocCtx
+{
+	int num_fields;
+	TSVector
+			field_tsvectors[TP_MAX_FIELDS]; /* per-column; NULL slot = empty */
+	int32	field_lengths[TP_MAX_FIELDS];	/* fieldnorm-quantized */
+} TpBm25fDocCtx;
+
+static TpBm25fDocCtx *tp_bm25f_doc_ctx = NULL;
 
 /*
  * Cache for per-query IDF values to avoid repeated segment lookups.
@@ -160,12 +194,12 @@ PG_FUNCTION_INFO_V1(tpquery_in);
 PG_FUNCTION_INFO_V1(tpquery_out);
 PG_FUNCTION_INFO_V1(tpquery_recv);
 PG_FUNCTION_INFO_V1(tpquery_send);
-PG_FUNCTION_INFO_V1(to_tpquery_text);
-PG_FUNCTION_INFO_V1(to_tpquery_text_index);
+PG_FUNCTION_INFO_V1(to_tpquery_unified);
 PG_FUNCTION_INFO_V1(bm25_text_bm25query_score);
 PG_FUNCTION_INFO_V1(bm25_text_text_score);
 PG_FUNCTION_INFO_V1(bm25_textarray_bm25query_score);
 PG_FUNCTION_INFO_V1(bm25_textarray_text_score);
+PG_FUNCTION_INFO_V1(bm25_record_bm25query_score);
 PG_FUNCTION_INFO_V1(tpquery_eq);
 PG_FUNCTION_INFO_V1(bm25_get_current_score);
 
@@ -196,6 +230,24 @@ tpquery_in(PG_FUNCTION_ARGS)
 	char	*str = PG_GETARG_CSTRING(0);
 	char	*colon;
 	TpQuery *result;
+	bool	 fuzzy				= false;
+	uint8	 fuzzy_max_distance = 0;
+
+	if (strncmp(str, "fuzzy(", 6) == 0)
+	{
+		char *endptr;
+		long  dist;
+
+		dist = strtol(str + 6, &endptr, 10);
+		if (endptr == str + 6 || endptr[0] != ')' || endptr[1] != ':' ||
+			dist < 1 || dist > UINT8_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid fuzzy bm25query input syntax")));
+		fuzzy			   = true;
+		fuzzy_max_distance = (uint8)dist;
+		str				   = endptr + 2;
+	}
 
 	/* Check for index name prefix (format: "index_name:query") */
 	colon = strchr(str, ':');
@@ -211,13 +263,15 @@ tpquery_in(PG_FUNCTION_ARGS)
 		index_name[index_name_len] = '\0';
 
 		/* Create query with index name (resolves to OID) */
-		result = create_tpquery_from_name(query_text, index_name);
+		result = create_tpquery_from_name_options(
+				query_text, index_name, false, fuzzy, fuzzy_max_distance);
 		pfree(index_name);
 	}
 	else
 	{
 		/* No index name prefix - create without index */
-		result = create_tpquery(str, InvalidOid);
+		result = create_tpquery_options(
+				str, InvalidOid, false, false, fuzzy, fuzzy_max_distance);
 	}
 
 	PG_RETURN_POINTER(result);
@@ -232,6 +286,10 @@ tpquery_out(PG_FUNCTION_ARGS)
 {
 	TpQuery	  *tpquery = (TpQuery *)PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
 	StringInfo str	   = makeStringInfo();
+
+	if (tpquery_is_fuzzy(tpquery))
+		appendStringInfo(
+				str, "fuzzy(%u):", tpquery_fuzzy_max_distance(tpquery));
 
 	if (OidIsValid(tpquery->index_oid))
 	{
@@ -263,6 +321,9 @@ tpquery_out(PG_FUNCTION_ARGS)
  *                   (4 bytes) + query_text
  * Binary format v2: version (1 byte) + flags (1 byte) + index_oid (4 bytes) +
  *                   query_text_len (4 bytes) + query_text
+ * Binary format v3: version (1 byte) + flags (1 byte) +
+ *                   fuzzy_max_distance (1 byte) + index_oid (4 bytes) +
+ *                   query_text_len (4 bytes) + query_text
  */
 Datum
 tpquery_recv(PG_FUNCTION_ARGS)
@@ -275,21 +336,25 @@ tpquery_recv(PG_FUNCTION_ARGS)
 	int32	   query_text_len;
 	char	  *query_text;
 	bool	   explicit_index;
+	bool	   fuzzy;
+	uint8	   fuzzy_max_distance = 0;
 
 	/* Read and validate version */
 	version = pq_getmsgbyte(buf);
-	if (version != 1 && version != 2)
+	if (version != 1 && version != 2 && version != 3)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("unsupported bm25query binary format version %u",
 						version),
-				 errhint("Expected version 1 or 2. This may indicate data "
+				 errhint("Expected version 1, 2, or 3. This may indicate data "
 						 "from "
 						 "an incompatible pg_textsearch version.")));
 
 	/* Read flags for v2+ */
 	if (version >= 2)
 		flags = pq_getmsgbyte(buf);
+	if (version >= 3)
+		fuzzy_max_distance = pq_getmsgbyte(buf);
 
 	index_oid	   = pq_getmsgint(buf, sizeof(Oid));
 	query_text_len = pq_getmsgint(buf, sizeof(int32));
@@ -305,7 +370,17 @@ tpquery_recv(PG_FUNCTION_ARGS)
 	query_text[query_text_len] = '\0';
 
 	explicit_index = (flags & TPQUERY_FLAG_EXPLICIT_INDEX) != 0;
-	result = create_tpquery_explicit(query_text, index_oid, explicit_index);
+	fuzzy		   = (flags & TPQUERY_FLAG_FUZZY) != 0;
+	{
+		bool grammar = (flags & TPQUERY_FLAG_GRAMMAR) != 0;
+		result		 = create_tpquery_options(
+				  query_text,
+				  index_oid,
+				  explicit_index,
+				  grammar,
+				  fuzzy,
+				  fuzzy_max_distance);
+	}
 	pfree(query_text);
 
 	PG_RETURN_POINTER(result);
@@ -313,7 +388,8 @@ tpquery_recv(PG_FUNCTION_ARGS)
 
 /*
  * tpquery send function (binary output)
- * Binary format v2: version (1 byte) + flags (1 byte) + index_oid (4 bytes) +
+ * Binary format v3: version (1 byte) + flags (1 byte) +
+ *                   fuzzy_max_distance (1 byte) + index_oid (4 bytes) +
  *                   query_text_len (4 bytes) + query_text
  */
 Datum
@@ -326,6 +402,7 @@ tpquery_send(PG_FUNCTION_ARGS)
 	pq_begintypsend(&buf);
 	pq_sendint8(&buf, TPQUERY_VERSION);
 	pq_sendint8(&buf, tpquery->flags);
+	pq_sendint8(&buf, tpquery->fuzzy_max_distance);
 	pq_sendint32(&buf, tpquery->index_oid);
 	pq_sendint32(&buf, tpquery->query_text_len);
 
@@ -336,33 +413,57 @@ tpquery_send(PG_FUNCTION_ARGS)
 }
 
 /*
- * Create a tpquery from text (no index - InvalidOid)
+ * Unified to_bm25query(text, text, bool, int) entry point.
+ * Args: query_text, index_name (NULL ok), grammar, fuzzy_max_distance
  */
 Datum
-to_tpquery_text(PG_FUNCTION_ARGS)
+to_tpquery_unified(PG_FUNCTION_ARGS)
 {
-	text	*input_text = PG_GETARG_TEXT_PP(0);
-	char	*query_text = text_to_cstring(input_text);
-	TpQuery *result		= create_tpquery(query_text, InvalidOid);
+	text	*input_text;
+	char	*query_text;
+	char	*index_name = NULL;
+	bool	 grammar	= false;
+	int32	 fuzzy_dist = 0;
+	TpQuery *result;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	input_text = PG_GETARG_TEXT_PP(0);
+	query_text = text_to_cstring(input_text);
+
+	if (!PG_ARGISNULL(1))
+		index_name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	if (!PG_ARGISNULL(2))
+		grammar = PG_GETARG_BOOL(2);
+
+	if (!PG_ARGISNULL(3))
+		fuzzy_dist = PG_GETARG_INT32(3);
+
+	if (fuzzy_dist < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("fuzzy_max_distance must be >= 0")));
+	if (fuzzy_dist > tp_max_fuzzy_distance)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("fuzzy_max_distance %d exceeds "
+						"pg_textsearch.max_fuzzy_distance (%d)",
+						fuzzy_dist,
+						tp_max_fuzzy_distance)));
+
+	result = create_tpquery_from_name_options(
+			query_text,
+			index_name,
+			grammar,
+			fuzzy_dist > 0,
+			(uint8)fuzzy_dist);
 
 	pfree(query_text);
-	PG_RETURN_POINTER(result);
-}
+	if (index_name)
+		pfree(index_name);
 
-/*
- * Create a tpquery from text with index name (resolves to OID)
- */
-Datum
-to_tpquery_text_index(PG_FUNCTION_ARGS)
-{
-	text	*input_text = PG_GETARG_TEXT_PP(0);
-	text	*index_text = PG_GETARG_TEXT_PP(1);
-	char	*query_text = text_to_cstring(input_text);
-	char	*index_name = text_to_cstring(index_text);
-	TpQuery *result		= create_tpquery_from_name(query_text, index_name);
-
-	pfree(query_text);
-	pfree(index_name);
 	PG_RETURN_POINTER(result);
 }
 
@@ -647,6 +748,33 @@ find_term_frequency(
 }
 
 /*
+ * Term-frequency lookup keyed by a raw cstring + length (for use
+ * with resolved-term lists where we don't have a WordEntry handy).
+ */
+static float4
+find_term_frequency_by_text(TSVector tsvector, const char *term, int term_len)
+{
+	WordEntry *entries		  = ARRPTR(tsvector);
+	char	  *lexemes_start  = STRPTR(tsvector);
+	int		   doc_term_count = tsvector->size;
+	int		   i;
+
+	for (i = 0; i < doc_term_count; i++)
+	{
+		char *doc_lexeme = lexemes_start + entries[i].pos;
+		if (entries[i].len == term_len &&
+			memcmp(doc_lexeme, term, term_len) == 0)
+		{
+			if (entries[i].haspos)
+				return (int32)POSDATALEN(tsvector, &entries[i]);
+			else
+				return 1;
+		}
+	}
+	return 0.0f;
+}
+
+/*
  * Helper: Calculate BM25 score for a single term
  */
 static float4
@@ -883,7 +1011,9 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 			fcinfo->flinfo->fn_extra = cache;
 		}
 
-		/* Tokenize the document text using the index's text configuration */
+		/* Normalize and tokenize the document text */
+		text_arg = tp_normalize_markup(
+				text_arg, (TpContentFormat)tp_metapage_field_format(metap, 0));
 		tsvector_datum = DirectFunctionCall2Coll(
 				to_tsvector_byid,
 				InvalidOid, /* collation */
@@ -891,17 +1021,6 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 				PointerGetDatum(text_arg));
 
 		tsvector = DatumGetTSVector(tsvector_datum);
-
-		/* Tokenize the query text to get query terms */
-		query_tsvector_datum = DirectFunctionCall2Coll(
-				to_tsvector_byid,
-				InvalidOid,
-				ObjectIdGetDatum(text_config_oid),
-				PointerGetDatum(cstring_to_text(query_text)));
-
-		query_tsvector		= DatumGetTSVector(query_tsvector_datum);
-		query_entries		= ARRPTR(query_tsvector);
-		query_lexemes_start = STRPTR(query_tsvector);
 
 		/*
 		 * Calculate document length with fieldnorm quantization.
@@ -911,7 +1030,216 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 		 */
 		doc_length = (float4)decode_fieldnorm(
 				encode_fieldnorm((int32)calculate_doc_length(tsvector)));
-		query_term_count = query_tsvector->size;
+
+		/*
+		 * Grammar-extension fast path: parse query, dictionary-expand
+		 * any prefix terms, and score against the resolved concrete-term
+		 * list. Bypasses the tsvector path which can't represent '*'.
+		 */
+		if (tpquery_is_fuzzy(query) || tpquery_is_grammar(query) ||
+			tp_metapage_is_multi_col(metap))
+		{
+			TpParsedQuery *pq				= tp_parse_query(query_text);
+			char		 **resolved_terms	= NULL;
+			int32		  *resolved_freqs	= NULL;
+			float4		  *resolved_weights = NULL;
+			int			   resolved_count;
+			int			   r_i;
+			bool		   phrase_failed = false;
+
+			if (tpquery_is_fuzzy(query) && tp_parsed_query_has_phrase(pq))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("fuzzy phrase queries are not supported yet"),
+						 errhint("Use bm25_fuzzy() with unquoted terms, or "
+								 "use to_bm25query() for exact phrases.")));
+
+			/*
+			 * Phrase verification first: if any phrase clause fails,
+			 * this doc isn't a match — return non-match score.
+			 */
+			if (tp_parsed_query_has_phrase(pq))
+			{
+				int	  p_i;
+				char *doc_cstr = text_to_cstring(text_arg);
+
+				for (p_i = 0; p_i < pq->term_count && !phrase_failed; p_i++)
+				{
+					TpQueryTerm	  *qt = &pq->terms[p_i];
+					TpPhraseResult vr;
+					bool		   last_is_prefix;
+
+					if (qt->kind != TP_QTERM_PHRASE &&
+						qt->kind != TP_QTERM_PHRASE_PREFIX)
+						continue;
+
+					last_is_prefix = (qt->kind == TP_QTERM_PHRASE_PREFIX);
+					vr			   = tp_phrase_verify_text(
+							doc_cstr,
+							text_config_oid,
+							qt->phrase_tokens,
+							qt->phrase_token_count,
+							last_is_prefix,
+							tp_metapage_field_format(metap, 0));
+					if (vr != TP_PHRASE_MATCH)
+						phrase_failed = true;
+				}
+				pfree(doc_cstr);
+			}
+
+			if (phrase_failed)
+			{
+				tp_free_parsed_query(pq);
+				pfree(metap);
+				metap = NULL;
+				index_close(index_rel, AccessShareLock);
+				index_rel = NULL;
+				/* Non-match: return 0 (positive 0 sorts after negatives). */
+				PG_RETURN_FLOAT8(0.0);
+			}
+
+			resolved_count = tp_resolve_query_terms_ex(
+					pq,
+					index_state,
+					index_rel,
+					level_heads,
+					text_config_oid,
+					metap,
+					tpquery_is_fuzzy(query),
+					tpquery_fuzzy_max_distance(query),
+					&resolved_terms,
+					&resolved_freqs,
+					tpquery_is_fuzzy(query) ? &resolved_weights : NULL);
+
+			for (r_i = 0; r_i < resolved_count; r_i++)
+			{
+				char		  *term	  = resolved_terms[r_i];
+				int			   tlen	  = (int)strlen(term);
+				int32		   q_freq = resolved_freqs[r_i];
+				float4		   tf;
+				float4		   idf;
+				float4		   term_score;
+				float4		   term_doc_length = doc_length;
+				TpPostingList *posting_list;
+				unsigned char  first_byte	 = (unsigned char)term[0];
+				int			   tag_field_idx = -1;
+
+				if (first_byte >= TP_FIELD_TAG_BASE)
+					tag_field_idx = first_byte - TP_FIELD_TAG_BASE;
+
+				/*
+				 * Phase 6.1d: when scoring a tagged term and we have
+				 * per-field tsvectors stashed by the record-LHS path,
+				 * find tf in that field's tsvector and use that field's
+				 * length.  Otherwise fall back to the flattened tsvector
+				 * (current behavior, an approximation).
+				 */
+				if (tag_field_idx >= 0 && tp_bm25f_doc_ctx != NULL &&
+					tag_field_idx < tp_bm25f_doc_ctx->num_fields &&
+					tp_bm25f_doc_ctx->field_tsvectors[tag_field_idx] != NULL)
+				{
+					tf = find_term_frequency_by_text(
+							tp_bm25f_doc_ctx->field_tsvectors[tag_field_idx],
+							term,
+							tlen);
+					term_doc_length =
+							tp_bm25f_doc_ctx->field_lengths[tag_field_idx];
+					if (term_doc_length <= 0)
+						term_doc_length = 1;
+				}
+				else
+				{
+					tf = find_term_frequency_by_text(tsvector, term, tlen);
+				}
+				if (tf == 0.0f)
+					continue;
+
+				{
+					uint32 cached_doc_freq = 0;
+					idf = lookup_cached_idf(cache, term, &cached_doc_freq);
+
+					if (idf < 0.0f)
+					{
+						uint32 unified_doc_freq	 = 0;
+						uint32 memtable_doc_freq = 0;
+						uint32 segment_doc_freq	 = 0;
+
+						posting_list = tp_get_posting_list(index_state, term);
+						if (posting_list && posting_list->doc_count > 0)
+							memtable_doc_freq = posting_list->doc_count;
+
+						for (int level = 0; level < TP_MAX_LEVELS; level++)
+						{
+							if (level_heads[level] != InvalidBlockNumber)
+							{
+								segment_doc_freq += tp_segment_get_doc_freq(
+										index_rel, level_heads[level], term);
+							}
+						}
+
+						unified_doc_freq = memtable_doc_freq +
+										   segment_doc_freq;
+						if (unified_doc_freq == 0)
+							continue;
+
+						idf = tp_calculate_idf(unified_doc_freq, total_docs);
+						cache_term_idf(cache, term, unified_doc_freq, idf);
+					}
+					if (resolved_weights != NULL)
+						idf *= resolved_weights[r_i];
+				}
+
+				{
+					float4 term_avgdl = avg_doc_len;
+
+					if (tag_field_idx >= 0)
+					{
+						float4 w =
+								tp_metapage_field_weight(metap, tag_field_idx);
+						idf *= w;
+						term_avgdl = tp_metapage_field_avgdl(
+								metap, tag_field_idx, avg_doc_len);
+					}
+
+					term_score = calculate_term_score(
+							tf,
+							idf,
+							term_doc_length,
+							term_avgdl,
+							metap->k1,
+							metap->b,
+							q_freq);
+					result += term_score;
+				}
+			}
+
+			for (r_i = 0; r_i < resolved_count; r_i++)
+				pfree(resolved_terms[r_i]);
+			if (resolved_terms)
+				pfree(resolved_terms);
+			if (resolved_freqs)
+				pfree(resolved_freqs);
+			if (resolved_weights)
+				pfree(resolved_weights);
+			tp_free_parsed_query(pq);
+
+			query_term_count = 0; /* skip tsvector loop below */
+		}
+		else
+		{
+			/* Tokenize the query text to get query terms */
+			query_tsvector_datum = DirectFunctionCall2Coll(
+					to_tsvector_byid,
+					InvalidOid,
+					ObjectIdGetDatum(text_config_oid),
+					PointerGetDatum(cstring_to_text(query_text)));
+
+			query_tsvector		= DatumGetTSVector(query_tsvector_datum);
+			query_entries		= ARRPTR(query_tsvector);
+			query_lexemes_start = STRPTR(query_tsvector);
+
+			query_term_count = query_tsvector->size;
+		}
 
 		/* Calculate BM25 score for each query term */
 		for (q_i = 0; q_i < query_term_count; q_i++)
@@ -1043,6 +1371,13 @@ tpquery_eq(PG_FUNCTION_ARGS)
 	if (a->index_oid != b->index_oid)
 		PG_RETURN_BOOL(false);
 
+	if (a->flags != b->flags)
+		PG_RETURN_BOOL(false);
+
+	if (tpquery_is_fuzzy(a) &&
+		tpquery_fuzzy_max_distance(a) != tpquery_fuzzy_max_distance(b))
+		PG_RETURN_BOOL(false);
+
 	/* Compare query text lengths */
 	if (a->query_text_len != b->query_text_len)
 		PG_RETURN_BOOL(false);
@@ -1060,31 +1395,49 @@ tpquery_eq(PG_FUNCTION_ARGS)
 }
 
 /*
- * Utility function to create a tpquery with resolved index OID and flags.
+ * Utility function to create a tpquery with resolved index OID and options.
  */
 TpQuery *
-create_tpquery_explicit(
-		const char *query_text, Oid index_oid, bool explicit_index)
+create_tpquery_options(
+		const char *query_text,
+		Oid			index_oid,
+		bool		explicit_index,
+		bool		grammar,
+		bool		fuzzy,
+		uint8		fuzzy_max_distance)
 {
 	TpQuery *result;
 	int		 query_text_len = strlen(query_text);
 	int		 total_size;
 
-	/* Calculate total size */
 	total_size = offsetof(TpQuery, data) + query_text_len + 1;
 
 	result = (TpQuery *)palloc0(total_size);
 	SET_VARSIZE(result, total_size);
-	result->version		   = TPQUERY_VERSION;
-	result->flags		   = explicit_index ? TPQUERY_FLAG_EXPLICIT_INDEX : 0;
-	result->index_oid	   = index_oid;
-	result->query_text_len = query_text_len;
+	result->version = TPQUERY_VERSION;
+	result->flags	= 0;
+	if (explicit_index)
+		result->flags |= TPQUERY_FLAG_EXPLICIT_INDEX;
+	if (grammar)
+		result->flags |= TPQUERY_FLAG_GRAMMAR;
+	if (fuzzy)
+		result->flags |= TPQUERY_FLAG_FUZZY;
+	result->fuzzy_max_distance = fuzzy ? fuzzy_max_distance : 0;
+	result->index_oid		   = index_oid;
+	result->query_text_len	   = query_text_len;
 
-	/* Copy query text */
 	memcpy(result->data, query_text, query_text_len);
 	result->data[query_text_len] = '\0';
 
 	return result;
+}
+
+TpQuery *
+create_tpquery_explicit(
+		const char *query_text, Oid index_oid, bool explicit_index)
+{
+	return create_tpquery_options(
+			query_text, index_oid, explicit_index, false, false, 0);
 }
 
 /*
@@ -1107,6 +1460,18 @@ create_tpquery(const char *query_text, Oid index_oid)
 TpQuery *
 create_tpquery_from_name(const char *query_text, const char *index_name)
 {
+	return create_tpquery_from_name_options(
+			query_text, index_name, false, false, 0);
+}
+
+TpQuery *
+create_tpquery_from_name_options(
+		const char *query_text,
+		const char *index_name,
+		bool		grammar,
+		bool		fuzzy,
+		uint8		fuzzy_max_distance)
+{
 	Oid	 index_oid		= InvalidOid;
 	bool explicit_index = false;
 
@@ -1122,7 +1487,13 @@ create_tpquery_from_name(const char *query_text, const char *index_name)
 		explicit_index = true;
 	}
 
-	return create_tpquery_explicit(query_text, index_oid, explicit_index);
+	return create_tpquery_options(
+			query_text,
+			index_oid,
+			explicit_index,
+			grammar,
+			fuzzy,
+			fuzzy_max_distance);
 }
 
 /*
@@ -1167,6 +1538,30 @@ tpquery_is_explicit_index(TpQuery *tpquery)
 	return (tpquery->flags & TPQUERY_FLAG_EXPLICIT_INDEX) != 0;
 }
 
+bool
+tpquery_is_grammar(TpQuery *tpquery)
+{
+	if (tpquery->version < 3)
+		return false;
+	return (tpquery->flags & TPQUERY_FLAG_GRAMMAR) != 0;
+}
+
+bool
+tpquery_is_fuzzy(TpQuery *tpquery)
+{
+	if (tpquery->version < 3)
+		return false;
+	return (tpquery->flags & TPQUERY_FLAG_FUZZY) != 0;
+}
+
+uint8
+tpquery_fuzzy_max_distance(TpQuery *tpquery)
+{
+	if (!tpquery_is_fuzzy(tpquery))
+		return 0;
+	return tpquery->fuzzy_max_distance;
+}
+
 /*
  * Scoring function for text <@> text operations.
  *
@@ -1209,6 +1604,154 @@ bm25_textarray_bm25query_score(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Standalone scoring for record <@> bm25query.
+ *
+ * The planner hook normally rewrites `(a, b) <@> q` to use the
+ * matching multi-col BM25 index for an exact BM25F index scan.
+ * This function is the fallback when the hook can't rewrite (no
+ * matching index, seq scan forced, etc.).
+ *
+ * Phase 6.1d: instead of flattening the record into one text and
+ * losing the per-column boundary, we deform the tuple, tokenize each
+ * text-like column separately, and stash the per-field tsvectors +
+ * fieldnorm-quantized lengths in tp_bm25f_doc_ctx.  The text scorer's
+ * grammar path then pulls tf and doc length from the right field for
+ * each tagged term, so the standalone scores match the index scan
+ * scores at the BM25F formula level.
+ *
+ * fcinfo->args[0] still gets a flattened text so untagged terms
+ * (rare in multi-col, but possible for legacy single-col indexes
+ * accessed via record LHS) score consistently with prior behavior.
+ */
+Datum
+bm25_record_bm25query_score(PG_FUNCTION_ARGS)
+{
+	Datum			record_datum = PG_GETARG_DATUM(0);
+	text		   *flattened	 = tp_flatten_record(record_datum);
+	HeapTupleHeader rec;
+	Oid				tupType;
+	int32			tupTypmod;
+	TupleDesc		tupdesc;
+	HeapTupleData	tuple;
+	TpBm25fDocCtx	ctx;
+	TpBm25fDocCtx  *saved;
+	TpQuery		   *query;
+	Oid				text_config_oid = InvalidOid;
+	Datum			result;
+	int				col;
+	uint8			rec_field_formats[TP_MAX_FIELDS];
+
+	memset(&ctx, 0, sizeof(ctx));
+	memset(rec_field_formats, 0, sizeof(rec_field_formats));
+
+	/*
+	 * Look up the bm25query's index to fetch text_config_oid for
+	 * tokenization.  We do this without taking a heavy lock; the
+	 * inner bm25_text_bm25query_score reopens the index properly.
+	 */
+	query = (TpQuery *)PG_DETOAST_DATUM(PG_GETARG_DATUM(1));
+	{
+		Oid				index_oid;
+		Relation		index_rel;
+		TpIndexMetaPage mp;
+
+		index_oid = get_tpquery_index_oid(query);
+		index_rel = validate_and_open_index(query, &index_oid);
+
+		if (index_rel != NULL)
+		{
+			mp				= tp_get_metapage(index_rel);
+			text_config_oid = mp->text_config_oid;
+			ctx.num_fields	= mp->num_fields;
+			memcpy(rec_field_formats,
+				   mp->field_formats,
+				   sizeof(rec_field_formats));
+			pfree(mp);
+			index_close(index_rel, AccessShareLock);
+		}
+	}
+
+	/*
+	 * Deform the record and tokenize each text-like column.  Skip
+	 * the per-field path entirely if the index isn't multi-col —
+	 * standalone scoring then behaves identically to the text-LHS
+	 * scorer on a flattened input.
+	 */
+	if (ctx.num_fields > 1 && OidIsValid(text_config_oid))
+	{
+		rec		  = DatumGetHeapTupleHeader(record_datum);
+		tupType	  = HeapTupleHeaderGetTypeId(rec);
+		tupTypmod = HeapTupleHeaderGetTypMod(rec);
+		tupdesc	  = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+		ItemPointerSetInvalid(&(tuple.t_self));
+		tuple.t_tableOid = InvalidOid;
+		tuple.t_len		 = HeapTupleHeaderGetDatumLength(rec);
+		tuple.t_data	 = rec;
+
+		for (col = 0; col < tupdesc->natts && col < ctx.num_fields &&
+					  col < TP_MAX_FIELDS;
+			 col++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, col);
+			Datum			  val;
+			bool			  isnull;
+			Oid				  typid = att->atttypid;
+			text			 *coltext;
+			Datum			  tsvec_datum;
+			TSVector		  tsvec;
+
+			if (att->attisdropped)
+				continue;
+
+			val = heap_getattr(&tuple, col + 1, tupdesc, &isnull);
+			if (isnull)
+				continue;
+
+			if (typid == TEXTOID || typid == VARCHAROID || typid == BPCHAROID)
+				coltext = DatumGetTextPP(val);
+			else if (tp_is_text_array_type(typid))
+				coltext = tp_flatten_text_array(val);
+			else
+				continue;
+
+			coltext = tp_normalize_markup(
+					coltext, (TpContentFormat)rec_field_formats[col]);
+
+			tsvec_datum = DirectFunctionCall2Coll(
+					to_tsvector_byid,
+					InvalidOid,
+					ObjectIdGetDatum(text_config_oid),
+					PointerGetDatum(coltext));
+			tsvec					 = DatumGetTSVector(tsvec_datum);
+			ctx.field_tsvectors[col] = tsvec;
+			ctx.field_lengths[col]	 = (int32)decode_fieldnorm(
+					  encode_fieldnorm((int32)calculate_doc_length(tsvec)));
+		}
+
+		ReleaseTupleDesc(tupdesc);
+	}
+
+	saved			 = tp_bm25f_doc_ctx;
+	tp_bm25f_doc_ctx = (ctx.num_fields > 1) ? &ctx : NULL;
+
+	fcinfo->args[0].value  = PointerGetDatum(flattened);
+	fcinfo->args[0].isnull = false;
+
+	PG_TRY();
+	{
+		result = bm25_text_bm25query_score(fcinfo);
+	}
+	PG_FINALLY();
+	{
+		tp_bm25f_doc_ctx = saved;
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+/*
  * Error stub for text[] <@> text when planner rewrite fails.
  */
 Datum
@@ -1218,9 +1761,8 @@ bm25_textarray_text_score(PG_FUNCTION_ARGS)
 			(errcode(ERRCODE_UNDEFINED_OBJECT),
 			 errmsg("no BM25 index found for text[] <@> text "
 					"expression"),
-			 errdetail(
-					 "Create a BM25 index on the column or "
-					 "use ORDER BY."),
+			 errdetail("Create a BM25 index on the column or "
+					   "use ORDER BY."),
 			 errhint("SELECT col <@> to_bm25query('q', 'idx') "
 					 "AS score")));
 

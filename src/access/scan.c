@@ -7,6 +7,7 @@
 #include <postgres.h>
 
 #include <access/genam.h>
+#include <access/parallel.h>
 #include <access/relscan.h>
 #include <access/sdir.h>
 #include <access/table.h>
@@ -20,13 +21,17 @@
 #include <utils/rel.h>
 
 #include "access/am.h"
+#include "access/scan_parallel.h"
 #include "constants.h"
 #include "index/limit.h"
 #include "index/metapage.h"
 #include "index/resolve.h"
 #include "index/state.h"
 #include "memtable/scan.h"
+#include "scoring/bm25.h"
+#include "scoring/bmw.h"
 #include "types/query.h"
+#include "types/query_parser.h"
 #include "types/vector.h"
 
 /*
@@ -99,7 +104,10 @@ tp_rescan_process_orderby(
 		{
 			Datum query_datum = orderby->sk_argument;
 			char *query_cstr;
-			Oid	  query_index_oid = InvalidOid;
+			Oid	  query_index_oid		   = InvalidOid;
+			bool  query_grammar			   = false;
+			bool  query_fuzzy			   = false;
+			uint8 query_fuzzy_max_distance = 0;
 
 			/*
 			 * Use sk_subtype to determine the argument type.
@@ -117,8 +125,11 @@ tp_rescan_process_orderby(
 				/* bm25query - extract query text and index OID */
 				TpQuery *query = (TpQuery *)DatumGetPointer(query_datum);
 
-				query_cstr		= pstrdup(get_tpquery_text(query));
-				query_index_oid = get_tpquery_index_oid(query);
+				query_cstr				 = pstrdup(get_tpquery_text(query));
+				query_index_oid			 = get_tpquery_index_oid(query);
+				query_grammar			 = tpquery_is_grammar(query);
+				query_fuzzy				 = tpquery_is_fuzzy(query);
+				query_fuzzy_max_distance = tpquery_fuzzy_max_distance(query);
 
 				/* Validate index OID if provided in query */
 				if (tpquery_has_index(query))
@@ -153,7 +164,10 @@ tp_rescan_process_orderby(
 			}
 
 			/* Store index OID for this scan */
-			so->index_oid = RelationGetRelid(scan->indexRelation);
+			so->index_oid	  = RelationGetRelid(scan->indexRelation);
+			so->query_grammar = query_grammar;
+			so->query_fuzzy	  = query_fuzzy;
+			so->query_fuzzy_max_distance = query_fuzzy_max_distance;
 
 			/* Mark all docs as candidates for ORDER BY operation */
 			if (metap && metap->total_docs > 0)
@@ -165,8 +179,52 @@ tp_rescan_process_orderby(
 }
 
 /*
- * Begin a scan of the Tapir index
+ * Parallel-scan callbacks (DSM sizing + initialization).
  */
+Size
+tp_parallel_scan_size(void)
+{
+	return MAXALIGN(sizeof(TpParallelScan));
+}
+
+Size
+tp_estimateparallelscan(int nkeys, int norderbys)
+{
+	(void)nkeys;
+	(void)norderbys;
+	return tp_parallel_scan_size();
+}
+
+void
+tp_initparallelscan(void *target)
+{
+	TpParallelScan *pscan = (TpParallelScan *)target;
+
+	pscan->num_segments = 0;
+	memset(pscan->segment_roots, 0, sizeof(pscan->segment_roots));
+	pg_atomic_init_u32(&pscan->setup_done, 0);
+	pg_atomic_init_u32(&pscan->next_segment_index, 0);
+	pg_atomic_init_u32(&pscan->workers_attached, 0);
+	pg_atomic_init_u32(&pscan->workers_done, 0);
+}
+
+void
+tp_parallelrescan(IndexScanDesc scan)
+{
+	if (scan == NULL || scan->parallel_scan == NULL)
+		return;
+
+	{
+		TpParallelScan *pscan = (TpParallelScan *)OffsetToPointer(
+				(void *)scan->parallel_scan, scan->parallel_scan->ps_offset);
+
+		pg_atomic_write_u32(&pscan->setup_done, 0);
+		pg_atomic_write_u32(&pscan->next_segment_index, 0);
+		pg_atomic_write_u32(&pscan->workers_attached, 0);
+		pg_atomic_write_u32(&pscan->workers_done, 0);
+	}
+}
+
 IndexScanDesc
 tp_beginscan(Relation index, int nkeys, int norderbys)
 {
@@ -283,6 +341,359 @@ tp_endscan(IndexScanDesc scan)
 	}
 }
 
+/* ----------------------------------------------------------------
+ * Parallel index scan: worker + leader paths
+ * ----------------------------------------------------------------
+ *
+ * Leader populates TpParallelScan in DSM (segment roots, IDF, BM25
+ * params), then scores memtable + claims segments.  Workers wait for
+ * setup_done, claim segments via atomic counter, deposit results to
+ * per-worker DSM slots, bump workers_done.  Leader merges after all
+ * attached workers finish.
+ */
+
+static TpParallelScan *
+tp_get_parallel_scan(IndexScanDesc scan)
+{
+	if (!scan->parallel_scan)
+		return NULL;
+	return (TpParallelScan *)OffsetToPointer(
+			(void *)scan->parallel_scan, scan->parallel_scan->ps_offset);
+}
+
+/*
+ * Claim segments from the work-stealing counter and score each
+ * into the given heap using single-term BMW.
+ */
+static void
+tp_parallel_claim_and_score(
+		IndexScanDesc scan, TpParallelScan *pscan, TpTopKHeap *heap)
+{
+	for (;;)
+	{
+		uint32			 idx;
+		TpSegmentReader *reader;
+
+		idx = pg_atomic_fetch_add_u32(&pscan->next_segment_index, 1);
+		if (idx >= (uint32)pscan->num_segments)
+			break;
+
+		reader = tp_segment_open(
+				scan->indexRelation, pscan->segment_roots[idx]);
+		score_segment_single_term_bmw(
+				heap,
+				reader,
+				pscan->query_term,
+				pscan->idf,
+				pscan->k1,
+				pscan->b,
+				pscan->term_avgdl,
+				NULL);
+		tp_segment_close(reader);
+	}
+}
+
+/*
+ * Worker path: wait for leader setup, claim segments, deposit
+ * results to DSM slot, signal done.  Always returns false (EOF).
+ */
+static bool
+tp_parallel_worker_run(
+		IndexScanDesc	   scan,
+		TpScanOpaque	   so,
+		TpLocalIndexState *index_state,
+		TpParallelScan	  *pscan)
+{
+	int					  slot;
+	uint32				  state;
+	TpTopKHeap			  heap;
+	TpParallelWorkerSlot *ws;
+	int					  i;
+
+	slot = ParallelWorkerNumber;
+	if (slot < 0 || slot >= TP_PARALLEL_MAX_WORKERS)
+	{
+		so->eof_reached = true;
+		return false;
+	}
+
+	pg_atomic_fetch_add_u32(&pscan->workers_attached, 1);
+
+	/* Spin-wait for leader to finish setup */
+	for (;;)
+	{
+		state = pg_atomic_read_u32(&pscan->setup_done);
+		if (state != 0)
+			break;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(100);
+	}
+
+	/* Ineligible → return EOF */
+	if (state == 2)
+	{
+		pg_atomic_fetch_add_u32(&pscan->workers_done, 1);
+		so->eof_reached = true;
+		return false;
+	}
+
+	/* Score claimed segments into a local heap */
+	tp_topk_init(&heap, pscan->max_results, CurrentMemoryContext);
+	tp_parallel_claim_and_score(scan, pscan, &heap);
+
+	/* Deposit results to DSM slot */
+	ws		  = &pscan->workers[slot];
+	ws->count = heap.size;
+	for (i = 0; i < heap.size; i++)
+	{
+		ws->entries[i].seg_block = heap.seg_blocks[i];
+		ws->entries[i].doc_id	 = heap.doc_ids[i];
+		ws->entries[i].score	 = heap.scores[i];
+	}
+
+	tp_topk_free(&heap);
+	pg_atomic_fetch_add_u32(&pscan->workers_done, 1);
+	so->eof_reached = true;
+	return false;
+}
+
+/*
+ * Leader path: check eligibility, set up DSM, score memtable +
+ * segments, wait for workers, merge, extract results.
+ *
+ * Returns true if parallel path ran (results in so->result_ctids).
+ * Returns false if query is ineligible (caller falls to serial).
+ */
+static bool
+tp_parallel_leader_run(
+		IndexScanDesc	   scan,
+		TpScanOpaque	   so,
+		TpLocalIndexState *index_state,
+		TpParallelScan	  *pscan,
+		TpIndexMetaPage	   metap)
+{
+	TpVector	  *query_vector;
+	TpVectorEntry *entry;
+	char		  *term;
+	int32		   total_docs;
+	float4		   avg_doc_len;
+	float4		   field_weights[TP_MAX_FIELDS];
+	float4		   field_avgdls[TP_MAX_FIELDS];
+	BlockNumber	   level_heads[TP_MAX_LEVELS];
+	uint32		   doc_freq;
+	float4		   idf;
+	float4		   term_avgdl;
+	int			   max_results;
+	int			   num_roots;
+	BlockNumber	  *roots;
+	TpTopKHeap	   heap;
+	int			   result_count;
+	int			   i;
+	uint32		   attached;
+	MemoryContext  oldctx;
+
+	/* Grammar/fuzzy/multi-col → ineligible for parallel */
+	if (so->query_text != NULL && (so->query_grammar || so->query_fuzzy ||
+								   tp_metapage_is_multi_col(metap)))
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		return false;
+	}
+
+	/* Tokenize query */
+	{
+		char *idx_name = tp_get_qualified_index_name(scan->indexRelation);
+		text *idx_text = cstring_to_text(idx_name);
+		text *q_text   = cstring_to_text(so->query_text);
+		Datum qv_datum = DirectFunctionCall2(
+				to_tpvector,
+				PointerGetDatum(q_text),
+				PointerGetDatum(idx_text));
+
+		query_vector = (TpVector *)DatumGetPointer(qv_datum);
+	}
+
+	if (!query_vector || query_vector->entry_count == 0)
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		return false;
+	}
+
+	/* Only single-term queries for now */
+	if (query_vector->entry_count != 1)
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		return false;
+	}
+
+	/* Extract the single term */
+	entry = get_tpvector_first_entry(query_vector);
+
+	/* Issue #3: term too long for DSM fixed-size buffer */
+	if (entry->lexeme_len >= NAMEDATALEN)
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		return false;
+	}
+
+	term = palloc(entry->lexeme_len + 1);
+	memcpy(term, entry->lexeme, entry->lexeme_len);
+	term[entry->lexeme_len] = '\0';
+
+	/* Read corpus stats */
+	total_docs = pg_atomic_read_u32(&index_state->shared->total_docs);
+	if (total_docs <= 0)
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		pfree(term);
+		return false;
+	}
+	avg_doc_len = (float4)(pg_atomic_read_u64(
+								   &index_state->shared->total_len) /
+						   (double)total_docs);
+	if (avg_doc_len <= 0.0f)
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		pfree(term);
+		return false;
+	}
+
+	for (i = 0; i < TP_MAX_LEVELS; i++)
+		level_heads[i] = metap->level_heads[i];
+	memcpy(field_weights, metap->field_weights, sizeof(field_weights));
+	for (i = 0; i < TP_MAX_FIELDS; i++)
+		field_avgdls[i] = tp_metapage_field_avgdl(metap, i, avg_doc_len);
+
+	/* Compute IDF */
+	doc_freq = tp_get_unified_doc_freq(
+			index_state, scan->indexRelation, term, level_heads);
+	if (doc_freq == 0)
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		pfree(term);
+		return false;
+	}
+	idf = tp_calculate_idf(doc_freq, total_docs);
+	idf *= tp_term_field_weight(term, field_weights);
+
+	/* Per-field avgdl for tagged terms */
+	term_avgdl = avg_doc_len;
+	{
+		unsigned char first = (unsigned char)term[0];
+		if (first >= TP_FIELD_TAG_BASE)
+		{
+			int fidx = first - TP_FIELD_TAG_BASE;
+			if (fidx >= 0 && fidx < TP_MAX_FIELDS && field_avgdls[fidx] > 0.0f)
+				term_avgdl = field_avgdls[fidx];
+		}
+	}
+
+	/* Collect segment roots */
+	num_roots = tp_collect_segment_roots(scan->indexRelation, metap, &roots);
+
+	/* Determine max_results */
+	max_results = (so->limit > 0) ? so->limit : tp_default_limit;
+	if (max_results > TP_PARALLEL_MAX_K ||
+		num_roots > TP_PARALLEL_MAX_SEGMENTS)
+	{
+		pg_atomic_write_u32(&pscan->setup_done, 2);
+		pfree(term);
+		if (roots)
+			pfree(roots);
+		return false;
+	}
+
+	/* Populate shared DSM state — clear worker slots first */
+	for (i = 0; i < TP_PARALLEL_MAX_WORKERS; i++)
+		pscan->workers[i].count = 0;
+
+	pscan->num_segments = num_roots;
+	for (i = 0; i < num_roots; i++)
+		pscan->segment_roots[i] = roots[i];
+	pscan->max_results = max_results;
+	memcpy(pscan->query_term, term, entry->lexeme_len + 1);
+	pscan->idf		  = idf;
+	pscan->term_avgdl = term_avgdl;
+	pscan->k1		  = metap->k1;
+	pscan->b		  = metap->b;
+
+	/* Signal workers: setup done, eligible */
+	pg_write_barrier();
+	pg_atomic_write_u32(&pscan->setup_done, 1);
+
+	/* ---- Leader scoring ---- */
+	tp_topk_init(&heap, max_results, CurrentMemoryContext);
+
+	/* Score memtable (leader-only) */
+	score_memtable_single_term(
+			&heap,
+			index_state,
+			term,
+			idf,
+			metap->k1,
+			metap->b,
+			term_avgdl,
+			NULL);
+
+	/* Leader also claims segments from work-stealing counter */
+	tp_parallel_claim_and_score(scan, pscan, &heap);
+
+	/* Wait for all attached workers to finish (no timeout —
+	 * returning early would silently drop worker results) */
+	pg_usleep(1000);
+	for (;;)
+	{
+		attached = pg_atomic_read_u32(&pscan->workers_attached);
+		if (pg_atomic_read_u32(&pscan->workers_done) >= attached)
+			break;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000);
+	}
+
+	/* Merge worker DSM slots into leader heap */
+	for (i = 0; i < TP_PARALLEL_MAX_WORKERS; i++)
+	{
+		TpParallelWorkerSlot *ws = &pscan->workers[i];
+		int					  j;
+
+		if (ws->count <= 0)
+			continue;
+		for (j = 0; j < ws->count; j++)
+		{
+			if (!tp_topk_dominated(&heap, ws->entries[j].score))
+			{
+				tp_topk_add_segment(
+						&heap,
+						ws->entries[j].seg_block,
+						ws->entries[j].doc_id,
+						ws->entries[j].score);
+			}
+		}
+	}
+
+	/* Resolve CTIDs and extract */
+	tp_topk_resolve_ctids(&heap, scan->indexRelation);
+
+	oldctx			 = MemoryContextSwitchTo(so->scan_context);
+	so->result_ctids = palloc(max_results * sizeof(ItemPointerData));
+	memset(so->result_ctids, 0, max_results * sizeof(ItemPointerData));
+	so->result_scores = palloc(max_results * sizeof(float4));
+
+	result_count = tp_topk_extract(&heap, so->result_ctids, so->result_scores);
+	MemoryContextSwitchTo(oldctx);
+
+	so->result_count	 = result_count;
+	so->current_pos		 = 0;
+	so->max_results_used = max_results;
+
+	tp_topk_free(&heap);
+	pfree(term);
+	if (roots)
+		pfree(roots);
+
+	return result_count > 0;
+}
+
 /*
  * Execute BM25 scoring query to get ordered results
  */
@@ -351,6 +762,61 @@ tp_execute_scoring_query(IndexScanDesc scan)
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to get metapage for index %s",
 						RelationGetRelationName(scan->indexRelation))));
+	}
+
+	/* Parallel scan dispatch */
+	if (scan->parallel_scan != NULL)
+	{
+		TpParallelScan *pscan = tp_get_parallel_scan(scan);
+
+		if (pscan)
+		{
+			if (IsParallelWorker())
+			{
+				tp_parallel_worker_run(scan, so, index_state, pscan);
+				tp_release_index_lock(index_state);
+				pfree(metap);
+				return false;
+			}
+
+			/* Leader: try parallel path */
+			if (tp_parallel_leader_run(scan, so, index_state, pscan, metap))
+			{
+				tp_release_index_lock(index_state);
+				pfree(metap);
+				return true;
+			}
+
+			/*
+			 * Ineligible for parallel — setup_done already set
+			 * to 2, workers will return EOF.  Fall through to
+			 * serial path.
+			 */
+		}
+	}
+
+	/*
+	 * Serial path.
+	 *
+	 * Route through the grammar-aware path when the query has a
+	 * grammar extension OR when the index is multi-column (whose
+	 * dictionary terms are all tag-prefixed, requiring the resolver
+	 * to either expand unqualified queries across fields or apply
+	 * field:term scoping).
+	 */
+	if (so->query_text != NULL && (so->query_grammar || so->query_fuzzy ||
+								   tp_metapage_is_multi_col(metap)))
+	{
+		success = tp_memtable_search_with_grammar(
+				scan,
+				index_state,
+				so->query_text,
+				metap,
+				so->query_fuzzy,
+				so->query_fuzzy_max_distance);
+		tp_release_index_lock(index_state);
+		pfree(metap);
+		return success;
 	}
 
 	/* Use the original query vector or create one from text */

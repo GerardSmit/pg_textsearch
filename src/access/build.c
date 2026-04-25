@@ -39,6 +39,7 @@
 #include "segment/merge.h"
 #include "segment/segment.h"
 #include "types/array.h"
+#include "types/markup.h"
 #include "types/vector.h"
 
 /*
@@ -557,6 +558,235 @@ tp_force_merge(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PG_FUNCTION_INFO_V1(tp_prewarm_index);
+
+/*
+ * SQL-callable: bm25_prewarm(index_name text) → int8
+ *
+ * Walks every page of the index relation via ReadBuffer, populating
+ * shared_buffers so subsequent queries hit warm cache. Analogous to
+ * contrib/pg_prewarm's pg_prewarm() for heap/indexes but scoped to
+ * the pg_textsearch on-disk layout. Returns the number of pages
+ * loaded (including any stub/free pages — the caller gets the full
+ * on-disk page count).
+ *
+ * Use case: after a server restart or during warm-up of a
+ * read-heavy workload, preload the positions + posting + skip index
+ * sections into memory so the first phrase query doesn't pay cold
+ * cache latency.
+ */
+Datum
+tp_prewarm_index(PG_FUNCTION_ARGS)
+{
+	text	   *index_name_text = PG_GETARG_TEXT_PP(0);
+	char	   *index_name		= text_to_cstring(index_name_text);
+	Oid			index_oid;
+	Relation	index_rel;
+	RangeVar   *rv;
+	BlockNumber nblocks;
+	BlockNumber blk;
+	int64		loaded = 0;
+
+	rv = makeRangeVarFromNameList(stringToQualifiedNameList(index_name, NULL));
+	index_oid = RangeVarGetRelid(rv, AccessShareLock, false);
+
+	if (!OidIsValid(index_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("index \"%s\" does not exist", index_name)));
+
+	index_rel = index_open(index_oid, AccessShareLock);
+	nblocks	  = RelationGetNumberOfBlocks(index_rel);
+
+	for (blk = 0; blk < nblocks; blk++)
+	{
+		Buffer buf = ReadBuffer(index_rel, blk);
+		/*
+		 * No lock needed — we just want the page resident in
+		 * shared_buffers. Release immediately so the buffer-clock
+		 * doesn't see us as a "long-running pin".
+		 */
+		ReleaseBuffer(buf);
+		loaded++;
+
+		/*
+		 * Yield to signal handlers every 1024 pages so CTRL-C /
+		 * query-cancel works on large indexes. Standard Postgres
+		 * pattern.
+		 */
+		if ((blk & 1023) == 0)
+			CHECK_FOR_INTERRUPTS();
+	}
+
+	index_close(index_rel, AccessShareLock);
+	pfree(index_name);
+
+	PG_RETURN_INT64(loaded);
+}
+
+/*
+ * Parse a comma-separated decimal list like "3.0,1.0,0.5" into
+ * weights[0..expected-1]. Errors on wrong count or non-numeric
+ * entries. Trailing/leading whitespace per entry is trimmed.
+ */
+static void
+tp_parse_field_weights(const char *raw, int expected, float4 *out_weights)
+{
+	const char *p = raw;
+	int			i;
+
+	for (i = 0; i < expected; i++)
+	{
+		char	   *endptr;
+		double		v;
+		const char *tok_start;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		tok_start = p;
+
+		errno = 0;
+		v	  = strtod(p, &endptr);
+		if (endptr == p || errno != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not parse field_weights at '%s'",
+							tok_start),
+					 errhint("Format: 'w0,w1,...' with one positive "
+							 "number per indexed column.")));
+		if (v <= 0.0 || v > 1e6)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("field_weights entry %d (%g) out of range (>0, "
+							"<=1e6)",
+							i,
+							v)));
+		out_weights[i] = (float4)v;
+		p			   = endptr;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (i < expected - 1)
+		{
+			if (*p != ',')
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("field_weights has fewer entries than "
+								"columns (expected %d)",
+								expected)));
+			p++;
+		}
+	}
+
+	while (*p == ' ' || *p == '\t' || *p == ',')
+		p++;
+	if (*p != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("field_weights has more entries than columns "
+						"(expected %d)",
+						expected)));
+}
+
+/*
+ * Parse content_format option into per-field format array.
+ *
+ * Bare value (e.g. "markdown") applies to all fields.
+ * Per-field syntax: "title:plain,body:markdown".
+ */
+static void
+tp_parse_content_formats(
+		const char		  *raw,
+		int				   num_fields,
+		const char *const *field_names,
+		uint8			  *out_formats)
+{
+	const char *p = raw;
+
+	while (*p == ' ' || *p == '\t')
+		p++;
+
+	/* Check if bare value (no colon before first comma/end) */
+	{
+		const char *scan	  = p;
+		bool		has_colon = false;
+		while (*scan && *scan != ',')
+		{
+			if (*scan == ':')
+			{
+				has_colon = true;
+				break;
+			}
+			scan++;
+		}
+
+		if (!has_colon)
+		{
+			TpContentFormat fmt = tp_parse_content_format(p);
+			int				i;
+			for (i = 0; i < num_fields; i++)
+				out_formats[i] = (uint8)fmt;
+			return;
+		}
+	}
+
+	/* Per-field syntax: "field:format,field:format,..." */
+	while (*p)
+	{
+		char field_name[TP_MAX_FIELD_NAME_LEN + 1];
+		char fmt_str[32];
+		int	 fi = 0, vi = 0;
+		int	 field_idx;
+
+		while (*p == ' ' || *p == '\t' || *p == ',')
+			p++;
+		if (*p == '\0')
+			break;
+
+		while (*p && *p != ':' && fi < TP_MAX_FIELD_NAME_LEN)
+			field_name[fi++] = *p++;
+		field_name[fi] = '\0';
+
+		if (*p != ':')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid content_format syntax "
+							"near \"%s\"",
+							field_name),
+					 errhint("Use 'field:format,...' or a "
+							 "bare format name.")));
+		p++;
+
+		while (*p && *p != ',' && vi < 31)
+			fmt_str[vi++] = *p++;
+		fmt_str[vi] = '\0';
+
+		/* Trim trailing whitespace */
+		while (vi > 0 && (fmt_str[vi - 1] == ' ' || fmt_str[vi - 1] == '\t'))
+			fmt_str[--vi] = '\0';
+
+		field_idx = -1;
+		{
+			int i;
+			for (i = 0; i < num_fields; i++)
+			{
+				if (pg_strcasecmp(field_names[i], field_name) == 0)
+				{
+					field_idx = i;
+					break;
+				}
+			}
+		}
+		if (field_idx < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("content_format references "
+							"unknown field \"%s\"",
+							field_name)));
+
+		out_formats[field_idx] = (uint8)tp_parse_content_format(fmt_str);
+	}
+}
+
 /*
  * Helper: Extract options from index relation
  */
@@ -566,12 +796,18 @@ tp_build_extract_options(
 		char   **text_config_name,
 		Oid		*text_config_oid,
 		double	*k1,
-		double	*b)
+		double	*b,
+		char   **field_weights_str,
+		char   **content_format_str)
 {
 	TpOptions *options;
 
 	*text_config_name = NULL;
 	*text_config_oid  = InvalidOid;
+	if (field_weights_str != NULL)
+		*field_weights_str = NULL;
+	if (content_format_str != NULL)
+		*content_format_str = NULL;
 
 	/* Extract options from index */
 	options = (TpOptions *)index->rd_options;
@@ -603,6 +839,17 @@ tp_build_extract_options(
 
 		*k1 = options->k1;
 		*b	= options->b;
+
+		if (field_weights_str != NULL && options->field_weights_offset > 0)
+		{
+			*field_weights_str = pstrdup(
+					(char *)options + options->field_weights_offset);
+		}
+		if (content_format_str != NULL && options->content_format_offset > 0)
+		{
+			*content_format_str = pstrdup(
+					(char *)options + options->content_format_offset);
+		}
 	}
 	else
 	{
@@ -617,11 +864,24 @@ tp_build_extract_options(
 }
 
 /*
- * Helper: Initialize metapage for new index
+ * Helper: Initialize metapage for new index, optionally with a
+ * multi-column field registry.
+ *
+ * When num_fields >= 2, terms in this index are stored with a leading
+ * tag byte identifying which column they came from, and the metapage
+ * records each column's name so `field:term` grammar can resolve to
+ * the tagged form.
  */
 static void
 tp_build_init_metapage(
-		Relation index, Oid text_config_oid, double k1, double b)
+		Relation		   index,
+		Oid				   text_config_oid,
+		double			   k1,
+		double			   b,
+		int				   num_fields,
+		const char *const *field_names,
+		const float4	  *field_weights,
+		const uint8		  *field_formats)
 {
 	Buffer			  metabuf;
 	GenericXLogState *state;
@@ -637,7 +897,13 @@ tp_build_init_metapage(
 	metapage =
 			GenericXLogRegisterBuffer(state, metabuf, GENERIC_XLOG_FULL_IMAGE);
 
-	tp_init_metapage(metapage, text_config_oid);
+	tp_init_metapage_multi(
+			metapage,
+			text_config_oid,
+			num_fields,
+			field_names,
+			field_weights,
+			field_formats);
 	metap	  = (TpIndexMetaPage)PageGetContents(metapage);
 	metap->k1 = k1;
 	metap->b  = b;
@@ -647,19 +913,26 @@ tp_build_init_metapage(
 }
 
 /*
- * Extract terms and frequencies from a TSVector
- * Returns the document length (sum of all term frequencies)
+ * Extract terms, frequencies, and (optionally) positions from a
+ * TSVector. Returns the document length (sum of all term frequencies).
+ *
+ * For each indexed term, TSVector stores 1-based ordinal positions
+ * of that term's occurrences in the source text. When positions_out is
+ * non-NULL we capture those ordinals. WEP_GETPOS strips the upper-2-bit
+ * weight from each WordEntryPos.
  */
 int
 tp_extract_terms_from_tsvector(
-		TSVector tsvector,
-		char  ***terms_out,
-		int32  **frequencies_out,
-		int		*term_count_out)
+		TSVector  tsvector,
+		char   ***terms_out,
+		int32	**frequencies_out,
+		uint32 ***positions_out,
+		int		 *term_count_out)
 {
 	int		   term_count = tsvector->size;
 	char	 **terms;
 	int32	  *frequencies;
+	uint32	 **positions  = NULL;
 	int		   doc_length = 0;
 	int		   i;
 	WordEntry *we;
@@ -670,6 +943,8 @@ tp_extract_terms_from_tsvector(
 	{
 		*terms_out		 = NULL;
 		*frequencies_out = NULL;
+		if (positions_out)
+			*positions_out = NULL;
 		return 0;
 	}
 
@@ -677,6 +952,8 @@ tp_extract_terms_from_tsvector(
 
 	terms		= palloc(term_count * sizeof(char *));
 	frequencies = palloc(term_count * sizeof(int32));
+	if (positions_out)
+		positions = palloc0(term_count * sizeof(uint32 *));
 
 	for (i = 0; i < term_count; i++)
 	{
@@ -693,17 +970,51 @@ tp_extract_terms_from_tsvector(
 
 		/* Get frequency from TSVector - count positions or default to 1 */
 		if (we[i].haspos)
-			frequencies[i] = (int32)POSDATALEN(tsvector, &we[i]);
+		{
+			int32 freq = (int32)POSDATALEN(tsvector, &we[i]);
+
+			frequencies[i] = freq;
+
+			if (positions != NULL && freq > 0)
+			{
+				WordEntryPos *posdata = POSDATAPTR(tsvector, &we[i]);
+				int			  j;
+
+				positions[i] = palloc(freq * sizeof(uint32));
+				for (j = 0; j < freq; j++)
+					positions[i][j] = (uint32)WEP_GETPOS(posdata[j]);
+			}
+		}
 		else
+		{
 			frequencies[i] = 1;
+			/* No position data — positions[i] stays NULL */
+		}
 
 		doc_length += frequencies[i];
 	}
 
 	*terms_out		 = terms;
 	*frequencies_out = frequencies;
+	if (positions_out)
+		*positions_out = positions;
 
 	return doc_length;
+}
+
+void
+tp_free_term_positions(uint32 **positions, int term_count)
+{
+	int i;
+
+	if (positions == NULL)
+		return;
+	for (i = 0; i < term_count; i++)
+	{
+		if (positions[i] != NULL)
+			pfree(positions[i]);
+	}
+	pfree(positions);
 }
 
 /*
@@ -737,19 +1048,23 @@ tp_process_document_text(
 		Oid				   text_config_oid,
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
-		int32			  *doc_length_out)
+		int32			  *doc_length_out,
+		uint8			   content_format)
 {
 	char	*document_str;
 	Datum	 tsvector_datum;
 	TSVector tsvector;
 	char   **terms;
 	int32	*frequencies;
+	uint32 **positions = NULL;
 	int		 term_count;
 	int		 doc_length;
 
 	if (!document_text || !index_state)
 		return false;
 
+	document_text = tp_normalize_markup(
+			document_text, (TpContentFormat)content_format);
 	document_str = text_to_cstring(document_text);
 
 	/* Validate the TID before processing */
@@ -770,9 +1085,9 @@ tp_process_document_text(
 
 	tsvector = DatumGetTSVector(tsvector_datum);
 
-	/* Extract lexemes and frequencies from TSVector */
+	/* Extract lexemes, frequencies, and positions from TSVector */
 	doc_length = tp_extract_terms_from_tsvector(
-			tsvector, &terms, &frequencies, &term_count);
+			tsvector, &terms, &frequencies, &positions, &term_count);
 
 	if (term_count > 0)
 	{
@@ -782,9 +1097,17 @@ tp_process_document_text(
 		 */
 		tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
 
-		/* Add document terms to posting lists */
+		/* Add document terms to posting lists (single-col legacy caller) */
 		tp_add_document_terms(
-				index_state, ctid, terms, frequencies, term_count, doc_length);
+				index_state,
+				ctid,
+				terms,
+				frequencies,
+				positions,
+				term_count,
+				doc_length,
+				NULL,
+				0);
 
 		/*
 		 * Check memory after document completion and auto-spill if needed.
@@ -796,6 +1119,7 @@ tp_process_document_text(
 		/* Free the terms array and individual lexemes */
 		tp_free_terms_array(terms, term_count);
 		pfree(frequencies);
+		tp_free_term_positions(positions, term_count);
 	}
 
 	if (doc_length_out)
@@ -814,10 +1138,14 @@ typedef struct TpBuildCallbackState
 	Relation		index;
 	Oid				text_config_oid;
 	MemoryContext	per_doc_ctx;
-	bool			is_text_array;
+	int				num_cols; /* >= 1; > 1 means multi-column */
+	bool			is_text_array[TP_MAX_FIELDS]; /* per column */
 	uint64			total_docs;
 	uint64			total_len;
-	uint64			tuples_done;
+	/* Phase 6.1d: per-field token sums across all batches */
+	uint64 total_len_per_field[TP_MAX_FIELDS];
+	uint64 tuples_done;
+	uint8  field_formats[TP_MAX_FIELDS];
 } TpBuildCallbackState;
 
 /*
@@ -836,59 +1164,159 @@ tp_build_callback(
 		void	   *state)
 {
 	TpBuildCallbackState *bs = (TpBuildCallbackState *)state;
-	text				 *document_text;
-	Datum				  tsvector_datum;
-	TSVector			  tsvector;
-	char				**terms;
-	int32				 *frequencies;
-	int					  term_count;
-	int					  doc_length;
 	MemoryContext		  oldctx;
+	bool				  multi_col					   = (bs->num_cols > 1);
+	char				**all_terms					   = NULL;
+	int32				 *all_freqs					   = NULL;
+	uint32				**all_positions				   = NULL;
+	int					  all_count					   = 0;
+	int					  all_cap					   = 0;
+	int					  total_doc_length			   = 0;
+	int32				  field_lengths[TP_MAX_FIELDS] = {0};
+	int					  col;
 
 	/* Suppress unused parameter warnings for callback signature */
 	(void)index;
 	(void)tupleIsAlive;
 
-	if (isnull[0])
-		return;
-
 	if (!ItemPointerIsValid(ctid))
 		return;
 
-	/*
-	 * Tokenize in temporary context to prevent
-	 * to_tsvector_byid memory from accumulating.
-	 * Detoasting also happens here so the copy is freed
-	 * by MemoryContextReset below.
-	 */
+	/* Skip tuple if ALL indexed columns are NULL */
+	{
+		bool any_non_null = false;
+		for (col = 0; col < bs->num_cols; col++)
+			if (!isnull[col])
+			{
+				any_non_null = true;
+				break;
+			}
+		if (!any_non_null)
+			return;
+	}
+
 	oldctx = MemoryContextSwitchTo(bs->per_doc_ctx);
 
-	if (bs->is_text_array)
-		document_text = tp_flatten_text_array(values[0]);
-	else
-		document_text = DatumGetTextPP(values[0]);
+	for (col = 0; col < bs->num_cols; col++)
+	{
+		text	*document_text;
+		Datum	 tsvector_datum;
+		TSVector tsvector;
+		char   **terms;
+		int32	*frequencies;
+		uint32 **positions = NULL;
+		int		 term_count;
+		int		 doc_length;
+		int		 i;
 
-	tsvector_datum = DirectFunctionCall2Coll(
-			to_tsvector_byid,
-			InvalidOid,
-			ObjectIdGetDatum(bs->text_config_oid),
-			PointerGetDatum(document_text));
-	tsvector = DatumGetTSVector(tsvector_datum);
+		if (isnull[col])
+			continue;
 
-	doc_length = tp_extract_terms_from_tsvector(
-			tsvector, &terms, &frequencies, &term_count);
+		if (bs->is_text_array[col])
+			document_text = tp_flatten_text_array(values[col]);
+		else
+			document_text = DatumGetTextPP(values[col]);
+
+		document_text = tp_normalize_markup(
+				document_text, (TpContentFormat)bs->field_formats[col]);
+
+		tsvector_datum = DirectFunctionCall2Coll(
+				to_tsvector_byid,
+				InvalidOid,
+				ObjectIdGetDatum(bs->text_config_oid),
+				PointerGetDatum(document_text));
+		tsvector = DatumGetTSVector(tsvector_datum);
+
+		doc_length = tp_extract_terms_from_tsvector(
+				tsvector, &terms, &frequencies, &positions, &term_count);
+
+		/*
+		 * Multi-col: prefix each term with a tag byte so dict entries
+		 * for different columns stay distinct. Single-col indexes
+		 * keep legacy untagged storage.
+		 */
+		if (multi_col && term_count > 0)
+		{
+			unsigned char tag = tp_field_tag_byte(col);
+			for (i = 0; i < term_count; i++)
+			{
+				size_t oldlen = strlen(terms[i]);
+				char  *tagged = palloc(oldlen + 2);
+				tagged[0]	  = (char)tag;
+				memcpy(tagged + 1, terms[i], oldlen + 1);
+				pfree(terms[i]);
+				terms[i] = tagged;
+			}
+		}
+
+		/* Append this column's terms/freqs/positions to all_* arrays. */
+		if (term_count > 0)
+		{
+			int need = all_count + term_count;
+			if (need > all_cap)
+			{
+				int new_cap = (all_cap == 0) ? 16 : all_cap * 2;
+				while (new_cap < need)
+					new_cap *= 2;
+				if (all_terms == NULL)
+				{
+					all_terms	  = palloc(new_cap * sizeof(char *));
+					all_freqs	  = palloc(new_cap * sizeof(int32));
+					all_positions = palloc(new_cap * sizeof(uint32 *));
+				}
+				else
+				{
+					all_terms = repalloc(all_terms, new_cap * sizeof(char *));
+					all_freqs = repalloc(all_freqs, new_cap * sizeof(int32));
+					all_positions = repalloc(
+							all_positions, new_cap * sizeof(uint32 *));
+				}
+				all_cap = new_cap;
+			}
+			for (i = 0; i < term_count; i++)
+			{
+				all_terms[all_count]	 = terms[i];
+				all_freqs[all_count]	 = frequencies[i];
+				all_positions[all_count] = positions ? positions[i] : NULL;
+				all_count++;
+			}
+			if (terms)
+				pfree(terms);
+			if (frequencies)
+				pfree(frequencies);
+			if (positions)
+				pfree(positions);
+		}
+
+		total_doc_length += doc_length;
+		if (col < TP_MAX_FIELDS)
+			field_lengths[col] = doc_length;
+	}
 
 	MemoryContextSwitchTo(oldctx);
 
-	if (term_count > 0)
+	if (all_count > 0)
 	{
-		tp_build_context_add_document(
-				bs->build_ctx,
-				terms,
-				frequencies,
-				term_count,
-				doc_length,
-				ctid);
+		if (multi_col)
+			tp_build_context_add_document_multi(
+					bs->build_ctx,
+					all_terms,
+					all_freqs,
+					all_positions,
+					all_count,
+					total_doc_length,
+					field_lengths,
+					bs->num_cols,
+					ctid);
+		else
+			tp_build_context_add_document(
+					bs->build_ctx,
+					all_terms,
+					all_freqs,
+					all_positions,
+					all_count,
+					total_doc_length,
+					ctid);
 	}
 
 	/* Reset per-doc context (frees tsvector, terms) */
@@ -897,8 +1325,13 @@ tp_build_callback(
 	/* Budget-based flush */
 	if (tp_build_context_should_flush(bs->build_ctx))
 	{
+		int f;
+
 		bs->total_docs += bs->build_ctx->num_docs;
 		bs->total_len += bs->build_ctx->total_len;
+		for (f = 0; f < TP_MAX_FIELDS; f++)
+			bs->total_len_per_field[f] +=
+					bs->build_ctx->total_len_per_field[f];
 
 		tp_build_flush_and_link(bs->build_ctx, bs->index);
 		tp_build_context_reset(bs->build_ctx);
@@ -932,7 +1365,15 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	uint64			   total_docs = 0;
 	uint64			   total_len  = 0;
 	TpLocalIndexState *index_state;
-	bool			   is_text_array;
+	int				   num_cols;
+	bool			   is_text_array[TP_MAX_FIELDS];
+	char		field_name_buf[TP_MAX_FIELDS][TP_MAX_FIELD_NAME_LEN + 1];
+	const char *field_names[TP_MAX_FIELDS];
+	int			col;
+	char	   *field_weights_str = NULL;
+	float4		field_weights[TP_MAX_FIELDS];
+	char	   *content_format_str = NULL;
+	uint8		field_formats[TP_MAX_FIELDS];
 
 	/* Show "started" for first partition only (suppresses duplicates) */
 	if (!build_progress.active || build_progress.partition_count == 0)
@@ -948,22 +1389,43 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	tp_invalidate_docid_cache();
 
 	/*
-	 * Determine if the indexed column is a text array type.
-	 * If so, we flatten array elements into a single text value
-	 * before tokenization. Expression indexes (attnum == 0)
-	 * are never text arrays.
+	 * Inspect each indexed column: capture its name (for the metapage
+	 * field registry) and whether it's a text[] (for per-column
+	 * flattening in tp_build_callback). Expression indexes
+	 * (attnum == 0) get a synthetic "expr_<N>" name.
 	 */
-	{
-		AttrNumber attnum = indexInfo->ii_IndexAttrNumbers[0];
+	num_cols = indexInfo->ii_NumIndexAttrs;
+	if (num_cols < 1 || num_cols > TP_MAX_FIELDS)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_textsearch supports 1..%d indexed columns, got %d",
+						TP_MAX_FIELDS,
+						num_cols)));
 
+	memset(is_text_array, 0, sizeof(is_text_array));
+	memset(field_name_buf, 0, sizeof(field_name_buf));
+	for (col = 0; col < num_cols; col++)
+	{
+		AttrNumber attnum = indexInfo->ii_IndexAttrNumbers[col];
 		if (attnum > 0)
 		{
-			Oid atttype = TupleDescAttr(RelationGetDescr(heap), attnum - 1)
-								  ->atttypid;
-			is_text_array = tp_is_text_array_type(atttype);
+			Form_pg_attribute att =
+					TupleDescAttr(RelationGetDescr(heap), attnum - 1);
+			is_text_array[col] = tp_is_text_array_type(att->atttypid);
+			strlcpy(field_name_buf[col],
+					NameStr(att->attname),
+					TP_MAX_FIELD_NAME_LEN + 1);
 		}
 		else
-			is_text_array = false;
+		{
+			is_text_array[col] = false;
+			snprintf(
+					field_name_buf[col],
+					TP_MAX_FIELD_NAME_LEN + 1,
+					"expr_%d",
+					col);
+		}
+		field_names[col] = field_name_buf[col];
 	}
 
 	/* Report initialization phase */
@@ -972,8 +1434,22 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE);
 
 	/* Extract options from index */
+	memset(field_weights, 0, sizeof(field_weights));
+	memset(field_formats, 0, sizeof(field_formats));
 	tp_build_extract_options(
-			index, &text_config_name, &text_config_oid, &k1, &b);
+			index,
+			&text_config_name,
+			&text_config_oid,
+			&k1,
+			&b,
+			&field_weights_str,
+			&content_format_str);
+
+	if (field_weights_str != NULL)
+		tp_parse_field_weights(field_weights_str, num_cols, field_weights);
+	if (content_format_str != NULL)
+		tp_parse_content_formats(
+				content_format_str, num_cols, field_names, field_formats);
 
 	/* Log configuration (only for first partition when active) */
 	if (!build_progress.active || build_progress.partition_count == 0)
@@ -986,7 +1462,15 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	}
 
 	/* Initialize metapage */
-	tp_build_init_metapage(index, text_config_oid, k1, b);
+	tp_build_init_metapage(
+			index,
+			text_config_oid,
+			k1,
+			b,
+			num_cols,
+			field_names,
+			field_weights_str != NULL ? field_weights : NULL,
+			content_format_str != NULL ? field_formats : NULL);
 
 	/*
 	 * Check memory limits before starting build.
@@ -1103,6 +1587,15 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 					 nworkers);
 			}
 
+			/*
+			 * Multi-column indexes are not yet supported by the
+			 * parallel build path (worker callback + buffile writer
+			 * remain single-column). Fall through to the serial
+			 * build when num_cols > 1.
+			 */
+			if (num_cols > 1)
+				goto skip_parallel_build;
+
 			par_result = tp_build_parallel(
 					heap,
 					index,
@@ -1110,8 +1603,9 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 					text_config_oid,
 					k1,
 					b,
-					is_text_array,
-					nworkers);
+					is_text_array[0],
+					nworkers,
+					field_formats);
 
 			/*
 			 * Create shared index state for runtime queries.
@@ -1181,6 +1675,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		}
 	}
 
+skip_parallel_build:
 	/*
 	 * Serial build using arena-based build context.
 	 *
@@ -1208,17 +1703,28 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		budget	  = (Size)maintenance_work_mem * 1024L;
 		build_ctx = tp_build_context_create(budget);
 
+		/*
+		 * Phase 6.1d: enable per-field fieldnorm tracking when this
+		 * index has > 1 columns.  Single-col goes through the legacy
+		 * (total-length) path.
+		 */
+		if (num_cols > 1)
+			tp_build_context_set_num_fields(build_ctx, num_cols);
+
 		/* Initialize callback state */
 		bs.build_ctx	   = build_ctx;
 		bs.index		   = index;
 		bs.text_config_oid = text_config_oid;
-		bs.is_text_array   = is_text_array;
-		bs.per_doc_ctx	   = AllocSetContextCreate(
+		bs.num_cols		   = num_cols;
+		memcpy(bs.is_text_array, is_text_array, sizeof(bs.is_text_array));
+		bs.per_doc_ctx = AllocSetContextCreate(
 				CurrentMemoryContext,
 				"build per-doc temp",
 				ALLOCSET_DEFAULT_SIZES);
-		bs.total_docs  = 0;
-		bs.total_len   = 0;
+		bs.total_docs = 0;
+		bs.total_len  = 0;
+		memset(bs.total_len_per_field, 0, sizeof(bs.total_len_per_field));
+		memcpy(bs.field_formats, field_formats, sizeof(bs.field_formats));
 		bs.tuples_done = 0;
 
 		/* Report loading phase */
@@ -1247,6 +1753,11 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		/* Accumulate final batch stats */
 		total_docs = bs.total_docs + build_ctx->num_docs;
 		total_len  = bs.total_len + build_ctx->total_len;
+		{
+			int f;
+			for (f = 0; f < TP_MAX_FIELDS; f++)
+				bs.total_len_per_field[f] += build_ctx->total_len_per_field[f];
+		}
 
 		pgstat_progress_update_param(
 				PROGRESS_CREATEIDX_TUPLES_DONE, bs.tuples_done);
@@ -1275,6 +1786,9 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 			metap->total_docs = total_docs;
 			metap->total_len  = total_len;
+			memcpy(metap->total_len_per_field,
+				   bs.total_len_per_field,
+				   sizeof(metap->total_len_per_field));
 
 			GenericXLogFinish(state);
 			UnlockReleaseBuffer(metabuf);
@@ -1423,76 +1937,179 @@ tp_insert(
 		bool			 indexUnchanged,
 		IndexInfo		*indexInfo)
 {
-	text			  *document_text;
-	Datum			   vector_datum;
-	TpVector		  *tpvec;
-	TpVectorEntry	  *vector_entry;
 	int32			  *frequencies = NULL;
-	int				   term_count;
-	int				   doc_length = 0;
-	int				   i;
+	uint32			 **positions   = NULL;
+	int				   term_count  = 0;
+	int				   doc_length  = 0;
 	TpLocalIndexState *index_state;
-	char			 **terms = NULL;
+	char			 **terms		   = NULL;
+	Oid				   text_config_oid = InvalidOid;
+	int				   num_cols;
+	int				   num_fields_in_metap;
+	bool			   multi_col;
+	int				   col;
+	int				   all_cap						= 0;
+	int32			   field_lengths[TP_MAX_FIELDS] = {0};
 
 	(void)checkUnique;	  /* unused */
 	(void)indexUnchanged; /* unused */
 
-	/* Skip NULL documents */
-	if (isnull[0])
-		return true;
+	num_cols = indexInfo->ii_NumIndexAttrs;
+	if (num_cols < 1 || num_cols > TP_MAX_FIELDS)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_textsearch supports 1..%d indexed columns, got %d",
+						TP_MAX_FIELDS,
+						num_cols)));
 
-	/* --- Phase 1: Tokenize (no lock held) --- */
+	/*
+	 * Look up the index's text_config_oid AND multi-col field count
+	 * from the metapage. multi_col is true iff the metapage registry
+	 * has ≥ 2 fields — independent of num_cols in indexInfo, which
+	 * should match in practice but we trust the metapage.
+	 */
+	uint8 field_formats_ins[TP_MAX_FIELDS];
+	memset(field_formats_ins, 0, sizeof(field_formats_ins));
 	{
-		AttrNumber attnum = indexInfo->ii_IndexAttrNumbers[0];
-		Oid		   atttype =
-				TupleDescAttr(RelationGetDescr(heapRel), attnum - 1)->atttypid;
-
-		if (tp_is_text_array_type(atttype))
-			document_text = tp_flatten_text_array(values[0]);
-		else
-			document_text = DatumGetTextPP(values[0]);
+		TpIndexMetaPage metap = tp_get_metapage(index);
+		text_config_oid		  = metap->text_config_oid;
+		num_fields_in_metap	  = metap->num_fields;
+		memcpy(field_formats_ins,
+			   metap->field_formats,
+			   sizeof(field_formats_ins));
+		pfree(metap);
 	}
+	multi_col = num_fields_in_metap > 1;
+
+	/* Skip tuple if all indexed columns are NULL */
 	{
-		char *index_name;
-		char *schema_name;
-		Oid	  namespace_oid = RelationGetNamespace(index);
-
-		schema_name = get_namespace_name(namespace_oid);
-		index_name	= quote_qualified_identifier(
-				 schema_name, RelationGetRelationName(index));
-
-		vector_datum = DirectFunctionCall2(
-				to_tpvector,
-				PointerGetDatum(document_text),
-				CStringGetTextDatum(index_name));
-
-		pfree(index_name);
-		pfree(schema_name);
+		bool any_non_null = false;
+		for (col = 0; col < num_cols; col++)
+			if (!isnull[col])
+			{
+				any_non_null = true;
+				break;
+			}
+		if (!any_non_null)
+			return true;
 	}
-	tpvec = (TpVector *)DatumGetPointer(vector_datum);
 
-	/* Extract terms and frequencies */
-	term_count = tpvec->entry_count;
-	if (term_count > 0)
+	/* --- Phase 1: Tokenize per column (no lock held) --- */
+	for (col = 0; col < num_cols; col++)
 	{
-		terms		= palloc(term_count * sizeof(char *));
-		frequencies = palloc(term_count * sizeof(int32));
+		text	*document_text;
+		Datum	 tsvector_datum;
+		TSVector tsvector;
+		char   **col_terms;
+		int32	*col_frequencies;
+		uint32 **col_positions = NULL;
+		int		 col_term_count;
+		int		 col_doc_length;
+		int		 i;
+		bool	 is_text_array_col;
 
-		vector_entry = TPVECTOR_ENTRIES_PTR(tpvec);
-		for (i = 0; i < term_count; i++)
+		if (isnull[col])
+			continue;
+
 		{
-			char *lexeme;
-
-			lexeme = palloc(vector_entry->lexeme_len + 1);
-			memcpy(lexeme, vector_entry->lexeme, vector_entry->lexeme_len);
-			lexeme[vector_entry->lexeme_len] = '\0';
-
-			terms[i]	   = lexeme;
-			frequencies[i] = vector_entry->frequency;
-			doc_length += vector_entry->frequency;
-
-			vector_entry = get_tpvector_next_entry(vector_entry);
+			AttrNumber attnum = indexInfo->ii_IndexAttrNumbers[col];
+			if (attnum > 0)
+			{
+				Oid atttype =
+						TupleDescAttr(RelationGetDescr(heapRel), attnum - 1)
+								->atttypid;
+				is_text_array_col = tp_is_text_array_type(atttype);
+			}
+			else
+				is_text_array_col = false;
 		}
+
+		if (is_text_array_col)
+			document_text = tp_flatten_text_array(values[col]);
+		else
+			document_text = DatumGetTextPP(values[col]);
+
+		document_text = tp_normalize_markup(
+				document_text, (TpContentFormat)field_formats_ins[col]);
+
+		if (OidIsValid(text_config_oid))
+		{
+			tsvector_datum = DirectFunctionCall2(
+					to_tsvector_byid,
+					ObjectIdGetDatum(text_config_oid),
+					PointerGetDatum(document_text));
+		}
+		else
+		{
+			tsvector_datum = DirectFunctionCall1(
+					to_tsvector, PointerGetDatum(document_text));
+		}
+		tsvector = DatumGetTSVector(tsvector_datum);
+
+		col_doc_length = tp_extract_terms_from_tsvector(
+				tsvector,
+				&col_terms,
+				&col_frequencies,
+				&col_positions,
+				&col_term_count);
+
+		if (multi_col && col_term_count > 0)
+		{
+			unsigned char tag = tp_field_tag_byte(col);
+			for (i = 0; i < col_term_count; i++)
+			{
+				size_t oldlen = strlen(col_terms[i]);
+				char  *tagged = palloc(oldlen + 2);
+				tagged[0]	  = (char)tag;
+				memcpy(tagged + 1, col_terms[i], oldlen + 1);
+				pfree(col_terms[i]);
+				col_terms[i] = tagged;
+			}
+		}
+
+		if (col_term_count > 0)
+		{
+			int need = term_count + col_term_count;
+			if (need > all_cap)
+			{
+				int new_cap = (all_cap == 0) ? 16 : all_cap * 2;
+				while (new_cap < need)
+					new_cap *= 2;
+				if (terms == NULL)
+				{
+					terms		= palloc(new_cap * sizeof(char *));
+					frequencies = palloc(new_cap * sizeof(int32));
+					positions	= palloc(new_cap * sizeof(uint32 *));
+				}
+				else
+				{
+					terms = repalloc(terms, new_cap * sizeof(char *));
+					frequencies =
+							repalloc(frequencies, new_cap * sizeof(int32));
+					positions =
+							repalloc(positions, new_cap * sizeof(uint32 *));
+				}
+				all_cap = new_cap;
+			}
+			for (i = 0; i < col_term_count; i++)
+			{
+				terms[term_count]		= col_terms[i];
+				frequencies[term_count] = col_frequencies[i];
+				positions[term_count]	= col_positions ? col_positions[i]
+														: NULL;
+				term_count++;
+			}
+			if (col_terms)
+				pfree(col_terms);
+			if (col_frequencies)
+				pfree(col_frequencies);
+			if (col_positions)
+				pfree(col_positions);
+		}
+
+		doc_length += col_doc_length;
+		if (col < TP_MAX_FIELDS)
+			field_lengths[col] = col_doc_length;
 	}
 
 	/* --- Phase 2: Shared-memory work (under lock) --- */
@@ -1567,8 +2184,11 @@ tp_insert(
 					ht_ctid,
 					terms,
 					frequencies,
+					positions,
 					term_count,
-					doc_length);
+					doc_length,
+					multi_col ? field_lengths : NULL,
+					multi_col ? num_cols : 0);
 
 			/*
 			 * Docid pages under LW_SHARED — spill clears
@@ -1596,10 +2216,12 @@ tp_insert(
 	/* Free the terms array and individual lexemes */
 	if (terms)
 	{
-		for (i = 0; i < term_count; i++)
-			pfree(terms[i]);
+		int t;
+		for (t = 0; t < term_count; t++)
+			pfree(terms[t]);
 		pfree(terms);
 		pfree(frequencies);
+		tp_free_term_positions(positions, term_count);
 	}
 
 	return true;

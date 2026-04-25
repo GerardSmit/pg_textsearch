@@ -1,22 +1,6 @@
 EXTENSION = pg_textsearch
 EXTVERSION = $(shell awk -F"'" '/default_version/ {print $$2}' pg_textsearch.control)
-DATA = sql/pg_textsearch--1.1.0.sql \
-       sql/pg_textsearch--0.0.1--0.0.2.sql \
-       sql/pg_textsearch--0.0.2--0.0.3.sql \
-       sql/pg_textsearch--0.0.3--0.0.4.sql \
-       sql/pg_textsearch--0.0.4--0.0.5.sql \
-       sql/pg_textsearch--0.0.5--0.1.0.sql \
-       sql/pg_textsearch--0.1.0--0.2.0.sql \
-       sql/pg_textsearch--0.2.0--0.3.0.sql \
-       sql/pg_textsearch--0.3.0--0.4.0.sql \
-       sql/pg_textsearch--0.4.0--0.4.1.sql \
-       sql/pg_textsearch--0.4.1--0.4.2.sql \
-       sql/pg_textsearch--0.4.2--0.5.0.sql \
-       sql/pg_textsearch--0.5.0--0.5.1.sql \
-       sql/pg_textsearch--0.5.1--0.6.0.sql \
-       sql/pg_textsearch--0.6.0--0.6.1.sql \
-       sql/pg_textsearch--0.6.1--1.0.0.sql \
-       sql/pg_textsearch--1.0.0--1.1.0.sql
+DATA = $(wildcard sql/pg_textsearch--*.sql)
 
 # Source files organized by directory
 OBJS = \
@@ -44,9 +28,12 @@ OBJS = \
 	src/segment/fieldnorm.o \
 	src/scoring/bmw.o \
 	src/scoring/bm25.o \
+	src/scoring/phrase.o \
 	src/types/array.o \
 	src/types/vector.o \
 	src/types/query.o \
+	src/types/query_parser.o \
+	src/types/fuzzy.o \
 	src/index/state.o \
 	src/index/registry.o \
 	src/index/metapage.o \
@@ -54,8 +41,11 @@ OBJS = \
 	src/index/memory.o \
 	src/index/resolve.o \
 	src/index/source.o \
+	src/highlight/highlight.o \
 	src/planner/hooks.o \
 	src/planner/cost.o \
+	src/types/markup.o \
+	src/vendor/md4c/md4c.o \
 	src/debug/dump.o
 
 # Shared library target
@@ -63,6 +53,8 @@ MODULE_big = pg_textsearch
 
 # Include directories, debug flags, and warning flags for unused code
 PG_CPPFLAGS = -I$(srcdir)/src -g -O2 -Wall -Wextra -Wunused-function -Wunused-variable -Wunused-parameter -Wunused-but-set-variable -DPG_TEXTSEARCH_VERSION=\"$(EXTVERSION)\"
+PG_CPPFLAGS += $(shell pkg-config --cflags libxml-2.0)
+SHLIB_LINK += $(shell pkg-config --libs libxml-2.0)
 
 # Suppress GCC-only false positives (clang silently ignores unknown -Wno-*
 # flags thanks to -Wno-unknown-warning-option):
@@ -70,11 +62,14 @@ PG_CPPFLAGS = -I$(srcdir)/src -g -O2 -Wall -Wextra -Wunused-function -Wunused-va
 #  -Wpacked-not-aligned: intentionally packed on-disk structs
 PG_CPPFLAGS += -Wno-unknown-warning-option -Wno-clobbered -Wno-packed-not-aligned
 
+# Suppress warnings for vendored code
+src/vendor/md4c/md4c.o: PG_CPPFLAGS += -w
+
 # Uncomment the following line to enable debug index dumps
 # PG_CPPFLAGS += -DDEBUG_DUMP_INDEX
 
 # Test configuration
-REGRESS = abort aerodocs basic binary_io bmw bulk_load catalog_stats compression concurrent_build coverage deletion vacuum vacuum_bitmap vacuum_extended vacuum_rebuild dropped empty explicit_index expression_index force_merge implicit index inheritance limits lock manyterms max_shared_memory memory merge mixed parallel_build parallel_bmw partitioned partitioned_many partial_index pgstats queries quoted_identifiers rescan schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security segment segment_integrity strings temp_table text_array text_config unsupported updates vector unlogged_index wand
+REGRESS = abort aerodocs basic binary_io bmw bulk_load catalog_stats compression concurrent_build coverage deletion vacuum vacuum_bitmap vacuum_extended vacuum_rebuild dropped empty explicit_index expression_index field_weights bm25f_validation force_merge fuzzy highlight implicit index inheritance limits lock manyterms markup max_shared_memory memory merge mixed multicol parallel_build parallel_bmw parallel_scan partitioned partitioned_many partial_index pgstats positions positions_stress prefix phrase phrase_prefix queries quoted_identifiers record_lhs rescan schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security segment segment_integrity strings temp_table text_array text_config unsupported updates vector unlogged_index wand
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG = pg_config
@@ -179,7 +174,7 @@ expected:
 lint-format:
 	@echo "Checking C code formatting with clang-format..."
 	@if command -v clang-format >/dev/null 2>&1; then \
-		find src/ -name "*.c" -o -name "*.h" | xargs clang-format --dry-run --Werror --style=file; \
+		find src/ \( -path src/vendor -prune \) -o \( -name "*.c" -o -name "*.h" \) -print | xargs clang-format --dry-run --Werror --style=file; \
 	else \
 		echo "clang-format not found - install with: brew install clang-format (macOS) or apt install clang-format (Linux)"; \
 		exit 1; \
@@ -189,7 +184,7 @@ lint-format:
 format:
 	@echo "Formatting C code with clang-format..."
 	@if command -v clang-format >/dev/null 2>&1; then \
-		find src/ -name "*.c" -o -name "*.h" | xargs clang-format -i --style=file; \
+		find src/ \( -path src/vendor -prune \) -o \( -name "*.c" -o -name "*.h" \) -print | xargs clang-format -i --style=file; \
 	else \
 		echo "clang-format not found - install with: brew install clang-format (macOS) or apt install clang-format (Linux)"; \
 		exit 1; \
@@ -199,7 +194,7 @@ format:
 format-diff:
 	@echo "Showing formatting differences..."
 	@if command -v clang-format >/dev/null 2>&1; then \
-		for file in `find src/ -name "*.c" -o -name "*.h"`; do \
+		for file in `find src/ \( -path src/vendor -prune \) -o \( -name "*.c" -o -name "*.h" \) -print`; do \
 			echo "=== $$file ==="; \
 			clang-format --style=file "$$file" | diff -u "$$file" - || true; \
 		done; \

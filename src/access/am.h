@@ -28,6 +28,9 @@ typedef struct TpScanOpaqueData
 	char	 *query_text;	/* Search query text */
 	TpVector *query_vector; /* Original query vector from ORDER BY */
 	Oid		  index_oid;	/* Index OID */
+	bool	  query_grammar;
+	bool	  query_fuzzy;
+	uint8	  query_fuzzy_max_distance;
 
 	/* Scan results state */
 	ItemPointer result_ctids;  /* Array of matching CTIDs */
@@ -50,6 +53,16 @@ typedef struct TpOptions
 	int32  text_config_offset; /* offset to text config string */
 	double k1;				   /* BM25 k1 parameter */
 	double b;				   /* BM25 b parameter */
+	/*
+	 * Phase 6.1b per-field BM25 multipliers. Storage: a
+	 * comma-separated decimal list like "3.0,1.0,0.5". Values are
+	 * parsed at build time and written into the metapage's
+	 * field_weights[] array; the string is not consulted at scan
+	 * time. Must have exactly as many entries as the index has
+	 * columns, else CREATE INDEX errors.
+	 */
+	int32 field_weights_offset;	 /* offset to field_weights string */
+	int32 content_format_offset; /* offset to content_format string */
 } TpOptions;
 
 /* Tapir-specific build phases for progress reporting */
@@ -113,14 +126,26 @@ bool tp_process_document_text(
 		Oid				   text_config_oid,
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
-		int32			  *doc_length_out);
+		int32			  *doc_length_out,
+		uint8			   content_format);
 
-/* Extract terms and frequencies from a TSVector */
+/*
+ * Extract terms, frequencies, and (optionally) positions from a
+ * TSVector. positions_out, when non-NULL, receives a palloc'd array
+ * of length term_count where each entry is either a palloc'd
+ * uint32[frequencies[i]] of 1-based ordinals or NULL when the
+ * TSVector entry has no position data. Caller frees via
+ * tp_free_term_positions().
+ */
 int tp_extract_terms_from_tsvector(
-		TSVector tsvector,
-		char  ***terms_out,
-		int32  **frequencies_out,
-		int		*term_count_out);
+		TSVector  tsvector,
+		char   ***terms_out,
+		int32	**frequencies_out,
+		uint32 ***positions_out,
+		int		 *term_count_out);
+
+/* Free per-term position arrays from tp_extract_terms_from_tsvector. */
+void tp_free_term_positions(uint32 **positions, int term_count);
 
 /* Build progress tracking for partitioned tables */
 void tp_build_progress_begin(void);
@@ -138,6 +163,13 @@ void		  tp_rescan(
 				 int		   norderbys);
 void tp_endscan(IndexScanDesc scan);
 bool tp_gettuple(IndexScanDesc scan, ScanDirection dir);
+
+/*
+ * Parallel scan callbacks (am/scan.c).
+ */
+Size tp_estimateparallelscan(int nkeys, int norderbys);
+void tp_initparallelscan(void *target);
+void tp_parallelrescan(IndexScanDesc scan);
 
 /*
  * Vacuum functions (am/vacuum.c)

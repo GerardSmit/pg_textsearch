@@ -35,8 +35,43 @@ extern int tp_score_documents(
 		ItemPointer		   result_ctids,
 		float4			 **result_scores);
 
+extern int tp_score_documents_weighted(
+		TpLocalIndexState *local_state,
+		Relation		   index_relation,
+		char			 **query_terms,
+		int32			  *query_frequencies,
+		float4			  *query_term_weights,
+		int				   query_term_count,
+		float4			   k1,
+		float4			   b,
+		int				   max_results,
+		ItemPointer		   result_ctids,
+		float4			 **result_scores);
+
 /* IDF calculation */
 extern float4 tp_calculate_idf(int32 doc_freq, int32 total_docs);
+
+/* Unified doc_freq across memtable + all segments */
+extern uint32 tp_get_unified_doc_freq(
+		TpLocalIndexState *local_state,
+		Relation		   index,
+		const char		  *term,
+		BlockNumber		  *level_heads);
+
+/* Per-field BM25 weight for a (possibly field-tagged) term */
+static inline float4
+tp_term_field_weight(const char *term, const float4 *field_weights)
+{
+	unsigned char tag = (unsigned char)term[0];
+	int			  idx;
+
+	if (tag < 0x80) /* TP_FIELD_TAG_BASE */
+		return 1.0f;
+	idx = tag - 0x80;
+	if (idx < 0 || idx >= 32) /* TP_MAX_FIELDS */
+		return 1.0f;
+	return (field_weights[idx] > 0.0f) ? field_weights[idx] : 1.0f;
+}
 
 /* GUC variable for BMW stats logging - defined in mod.c */
 extern bool tp_log_bmw_stats;

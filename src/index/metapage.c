@@ -63,18 +63,35 @@ tp_invalidate_docid_cache(void)
 }
 
 /*
- * Initialize Tapir index metapage
+ * Initialize Tapir index metapage with an explicit field registry.
+ *
+ * num_fields: 1 for single-column (legacy behavior; field_names may be
+ *             NULL or contain a single empty string); >= 2 for multi-
+ *             column indexes with field-tagged term storage.
+ * field_names: array of num_fields names, each up to
+ *              TP_MAX_FIELD_NAME_LEN chars. Copied into the metapage.
  */
 void
-tp_init_metapage(Page page, Oid text_config_oid)
+tp_init_metapage_multi(
+		Page			   page,
+		Oid				   text_config_oid,
+		int				   num_fields,
+		const char *const *field_names,
+		const float4	  *field_weights,
+		const uint8		  *field_formats)
 {
 	TpIndexMetaPage metap;
 	PageHeader		phdr;
 	int				i;
 
-	/*
-	 * Initialize page with no special space - metapage uses page content area
-	 */
+	if (num_fields < 1 || num_fields > TP_MAX_FIELDS)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("invalid field count %d (valid range 1..%d)",
+						num_fields,
+						TP_MAX_FIELDS)));
+
+	/* Metapage uses page content area; no special space. */
 	PageInit(page, BLCKSZ, 0);
 	metap = (TpIndexMetaPage)PageGetContents(page);
 
@@ -87,16 +104,86 @@ tp_init_metapage(Page page, Oid text_config_oid)
 	metap->root_blkno		   = InvalidBlockNumber;
 	metap->first_docid_page	   = InvalidBlockNumber;
 
-	/* Initialize hierarchical segment levels */
 	for (i = 0; i < TP_MAX_LEVELS; i++)
 	{
 		metap->level_heads[i]  = InvalidBlockNumber;
 		metap->level_counts[i] = 0;
 	}
 
-	/* Update page header to reflect that we've used space for metapage */
+	/* V7+ field registry */
+	metap->num_fields = (uint16)num_fields;
+	metap->_pad_v7	  = 0;
+	memset(metap->field_names, 0, sizeof(metap->field_names));
+	if (field_names != NULL)
+	{
+		for (i = 0; i < num_fields; i++)
+		{
+			if (field_names[i] == NULL)
+				continue;
+			strlcpy(metap->field_names[i],
+					field_names[i],
+					TP_MAX_FIELD_NAME_LEN + 1);
+		}
+	}
+
+	/*
+	 * V8 field weights. Zeroed by default — read accessors interpret
+	 * 0.0 as default 1.0 so legacy V7 structs remain readable under
+	 * a lenient upgrade path.
+	 */
+	memset(metap->field_weights, 0, sizeof(metap->field_weights));
+	if (field_weights != NULL)
+	{
+		for (i = 0; i < num_fields; i++)
+		{
+			if (field_weights[i] > 0.0f)
+				metap->field_weights[i] = field_weights[i];
+		}
+	}
+
+	/*
+	 * V9 per-field length totals.  Populated by builders and spill
+	 * sites; start at zero.
+	 */
+	memset(metap->total_len_per_field, 0, sizeof(metap->total_len_per_field));
+
+	/* Per-field content format (plain/html/markdown). */
+	memset(metap->field_formats, 0, sizeof(metap->field_formats));
+	if (field_formats != NULL)
+	{
+		for (i = 0; i < num_fields; i++)
+			metap->field_formats[i] = field_formats[i];
+	}
+
 	phdr		   = (PageHeader)page;
 	phdr->pd_lower = SizeOfPageHeaderData + sizeof(TpIndexMetaPageData);
+}
+
+/*
+ * Legacy single-column init wrapper. Emits a V7 metapage with
+ * num_fields = 1 and an empty field name, which callers interpret as
+ * "untagged legacy storage" (no multi-col behavior).
+ */
+void
+tp_init_metapage(Page page, Oid text_config_oid)
+{
+	const char *single_empty[1] = {""};
+	tp_init_metapage_multi(page, text_config_oid, 1, single_empty, NULL, NULL);
+}
+
+int
+tp_metapage_find_field(const TpIndexMetaPageData *metap, const char *name)
+{
+	int i;
+
+	if (metap == NULL || name == NULL)
+		return -1;
+	for (i = 0; i < metap->num_fields; i++)
+	{
+		if (strcmp(metap->field_names[i], name) == 0)
+			return i;
+	}
+	return -1;
 }
 
 /*

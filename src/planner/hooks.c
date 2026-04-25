@@ -64,6 +64,7 @@ typedef struct BM25OidCache
 	Oid text_text_operator_oid;
 	Oid textarray_tpquery_operator_oid;
 	Oid textarray_text_operator_oid;
+	Oid record_tpquery_operator_oid;
 } BM25OidCache;
 
 /*
@@ -183,6 +184,12 @@ lookup_bm25_oids_internal(BM25OidCache *cache)
 	opname = list_make1(makeString("<@>"));
 	cache->textarray_text_operator_oid =
 			OpernameGetOprid(opname, TEXTARRAYOID, TEXTOID);
+	list_free(opname);
+
+	/* Look up the <@> operator for (record, bm25query) */
+	opname = list_make1(makeString("<@>"));
+	cache->record_tpquery_operator_oid =
+			OpernameGetOprid(opname, RECORDOID, cache->tpquery_type_oid);
 	list_free(opname);
 
 	return true;
@@ -469,6 +476,98 @@ find_index_for_var(Var *var, ResolveIndexContext *context)
 }
 
 /*
+ * Find a BM25 index on `relid` whose indexed columns match the
+ * ordered list `attnums` exactly — same count, same order.  This is
+ * used to resolve `(col_a, col_b) <@> bm25query` to the multi-col
+ * index built on those same columns.  Returns InvalidOid on no
+ * match or on ambiguous multiple matches.
+ */
+static Oid
+find_bm25_index_for_attnums(
+		Oid relid, const AttrNumber *attnums, int nattnums, Oid bm25_am_oid)
+{
+	Relation	indexRelation;
+	SysScanDesc scan;
+	HeapTuple	indexTuple;
+	Oid			result	= InvalidOid;
+	int			n_found = 0;
+	ScanKeyData scanKey;
+
+	if (!OidIsValid(bm25_am_oid) || nattnums <= 0)
+		return InvalidOid;
+
+	indexRelation = table_open(IndexRelationId, AccessShareLock);
+
+	ScanKeyInit(
+			&scanKey,
+			Anum_pg_index_indrelid,
+			BTEqualStrategyNumber,
+			F_OIDEQ,
+			ObjectIdGetDatum(relid));
+
+	scan = systable_beginscan(
+			indexRelation, IndexIndrelidIndexId, true, NULL, 1, &scanKey);
+
+	while ((indexTuple = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_index indexForm = (Form_pg_index)GETSTRUCT(indexTuple);
+		Oid			  indexOid	= indexForm->indexrelid;
+		HeapTuple	  classTuple;
+		Oid			  indexAmOid;
+		bool		  match;
+		int			  i;
+		Datum		  predDatum;
+		bool		  predNull;
+
+		classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(indexOid));
+		if (!HeapTupleIsValid(classTuple))
+			continue;
+		indexAmOid = ((Form_pg_class)GETSTRUCT(classTuple))->relam;
+		ReleaseSysCache(classTuple);
+
+		if (indexAmOid != bm25_am_oid)
+			continue;
+
+		if (indexForm->indnatts != nattnums)
+			continue;
+
+		predDatum = SysCacheGetAttr(
+				INDEXRELID, indexTuple, Anum_pg_index_indpred, &predNull);
+		(void)predDatum;
+		if (!predNull)
+			continue; /* skip partial indexes for implicit resolution */
+
+		match = true;
+		for (i = 0; i < nattnums; i++)
+		{
+			if (indexForm->indkey.values[i] != attnums[i])
+			{
+				match = false;
+				break;
+			}
+		}
+		if (match)
+		{
+			if (result == InvalidOid)
+				result = indexOid;
+			n_found++;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(indexRelation, AccessShareLock);
+
+	if (n_found > 1)
+	{
+		ereport(WARNING,
+				(errmsg("multiple BM25 indexes match the LHS column list; "
+						"using first found — qualify with to_bm25query"
+						"('...', 'index_name') to pick one explicitly")));
+	}
+	return (n_found == 1) ? result : (n_found > 1 ? result : InvalidOid);
+}
+
+/*
  * Find BM25 index matching an expression on a relation.
  * For plain Var, delegates to find_bm25_index_for_column.
  * For complex expressions, compares expression trees.
@@ -612,7 +711,13 @@ create_resolved_tpquery_const(Const *original, Oid index_oid)
 {
 	TpQuery *old_tpquery = (TpQuery *)DatumGetPointer(original->constvalue);
 	char	*query_text	 = get_tpquery_text(old_tpquery);
-	TpQuery *new_tpquery = create_tpquery(query_text, index_oid);
+	TpQuery *new_tpquery = create_tpquery_options(
+			query_text,
+			index_oid,
+			tpquery_is_explicit_index(old_tpquery),
+			tpquery_is_grammar(old_tpquery),
+			tpquery_is_fuzzy(old_tpquery),
+			tpquery_fuzzy_max_distance(old_tpquery));
 
 	return makeConst(
 			original->consttype,
@@ -661,7 +766,8 @@ transform_tpquery_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 	Const		 *new_const;
 
 	if (opexpr->opno != oids->text_tpquery_operator_oid &&
-		opexpr->opno != oids->textarray_tpquery_operator_oid)
+		opexpr->opno != oids->textarray_tpquery_operator_oid &&
+		opexpr->opno != oids->record_tpquery_operator_oid)
 		return NULL;
 
 	/* Mark that we found a BM25 operator for later optimization */
@@ -685,6 +791,99 @@ transform_tpquery_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 		return NULL;
 
 	tpquery = (TpQuery *)DatumGetPointer(constNode->constvalue);
+
+	/*
+	 * Phase 6.1c: `(col1, col2, ...) <@> bm25query` — a RowExpr LHS
+	 * is sugar for "use the multi-col BM25 index whose indexed
+	 * columns are exactly this list".  We find that index (or
+	 * trust an explicit index_oid on the tpquery), then rewrite
+	 * the LHS to the first Var so the rest of the pipeline treats
+	 * it like a normal `text <@> bm25query` — same opclass, same
+	 * index access path.
+	 */
+	if (opexpr->opno == oids->record_tpquery_operator_oid &&
+		IsA(left, RowExpr))
+	{
+		RowExpr	  *row = (RowExpr *)left;
+		AttrNumber attnums[INDEX_MAX_KEYS];
+		int		   nattnums	 = 0;
+		Oid		   row_relid = InvalidOid;
+		ListCell  *lc;
+		Node	  *first_var	= NULL;
+		bool	   all_vars		= true;
+		bool	   same_relvar	= true;
+		int		   common_varno = 0;
+		Oid		   resolved_idx = InvalidOid;
+
+		foreach (lc, row->args)
+		{
+			Node *arg = (Node *)lfirst(lc);
+			Var	 *v;
+
+			if (!IsA(arg, Var))
+			{
+				all_vars = false;
+				break;
+			}
+			v = (Var *)arg;
+
+			if (first_var == NULL)
+			{
+				first_var	 = arg;
+				common_varno = v->varno;
+			}
+			else if (v->varno != common_varno)
+			{
+				same_relvar = false;
+				break;
+			}
+
+			if (nattnums >= INDEX_MAX_KEYS)
+			{
+				all_vars = false;
+				break;
+			}
+			attnums[nattnums++] = v->varattno;
+		}
+
+		if (!all_vars || !same_relvar || nattnums < 1)
+			return NULL;
+
+		{
+			AttrNumber tmp_attnum;
+			(void)get_var_relation_and_attnum(
+					(Var *)first_var, context->query, &row_relid, &tmp_attnum);
+		}
+		if (!OidIsValid(row_relid))
+			return NULL;
+
+		if (OidIsValid(tpquery->index_oid))
+		{
+			resolved_idx = tpquery->index_oid;
+		}
+		else
+		{
+			resolved_idx = find_bm25_index_for_attnums(
+					row_relid, attnums, nattnums, oids->bm25_am_oid);
+			if (!OidIsValid(resolved_idx))
+				return NULL;
+		}
+
+		{
+			Const *idx_const  = tpquery->index_oid == resolved_idx
+									  ? constNode
+									  : create_resolved_tpquery_const(
+												constNode, resolved_idx);
+			Oid	   var_collid = ((Var *)first_var)->varcollid;
+
+			return (Node *)create_opexpr(
+					oids->text_tpquery_operator_oid,
+					first_var,
+					(Node *)idx_const,
+					OidIsValid(var_collid) ? var_collid : opexpr->inputcollid,
+					opexpr->location);
+		}
+	}
 
 	/*
 	 * Reject constant left operands (no table column refs).
@@ -728,10 +927,9 @@ transform_tpquery_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 									"column \"%s\"",
 									index_name ? index_name : "(unknown)",
 									col_name ? col_name : "(unknown)"),
-							 errdetail(
-									 "The explicitly specified "
-									 "index is not built on the "
-									 "column being searched."),
+							 errdetail("The explicitly specified "
+									   "index is not built on the "
+									   "column being searched."),
 							 errhint("Use an index that is built"
 									 " on column \"%s\" of table"
 									 " \"%s\", or omit the index"
@@ -1828,10 +2026,9 @@ validate_indexscan_explicit_index(IndexScan *indexscan, BM25OidCache *oids)
 							"index \"%s\"",
 							specified_name ? specified_name : "(unknown)",
 							scan_name ? scan_name : "(unknown)"),
-					 errdetail(
-							 "When an explicit index is specified in "
-							 "to_bm25query(), that index must be used for "
-							 "the scan to ensure consistent tokenization."),
+					 errdetail("When an explicit index is specified in "
+							   "to_bm25query(), that index must be used for "
+							   "the scan to ensure consistent tokenization."),
 					 errhint("Use a planner hint to force the specified "
 							 "index, or remove the explicit index name to let "
 							 "the planner choose automatically.")));

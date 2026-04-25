@@ -74,14 +74,14 @@ tp_handler(PG_FUNCTION_ARGS)
 #endif
 	amroutine->amcanbackward	  = false; /* Cannot scan backwards */
 	amroutine->amcanunique		  = false; /* Cannot enforce uniqueness */
-	amroutine->amcanmulticol	  = false; /* Single column only */
-	amroutine->amoptionalkey	  = true;  /* Can scan without search key */
+	amroutine->amcanmulticol	  = true; /* Multi-col: field-scoped queries */
+	amroutine->amoptionalkey	  = true; /* Can scan without search key */
 	amroutine->amsearcharray	  = false; /* No array search support */
 	amroutine->amsearchnulls	  = false; /* Cannot search for NULLs */
 	amroutine->amstorage		  = false; /* No separate storage type */
 	amroutine->amclusterable	  = false; /* Cannot cluster on this index */
 	amroutine->ampredlocks		  = false; /* No predicate locking */
-	amroutine->amcanparallel	  = false; /* No parallel scan support yet */
+	amroutine->amcanparallel	  = true;
 	amroutine->amcanbuildparallel = true;
 	amroutine->amcaninclude		  = false; /* No INCLUDE columns */
 	amroutine->amusemaintenanceworkmem =
@@ -111,9 +111,9 @@ tp_handler(PG_FUNCTION_ARGS)
 	amroutine->amendscan		= tp_endscan;
 	amroutine->ammarkpos		= NULL; /* No mark/restore support */
 	amroutine->amrestrpos		= NULL;
-	amroutine->amestimateparallelscan = NULL; /* No parallel support yet */
-	amroutine->aminitparallelscan	  = NULL;
-	amroutine->amparallelrescan		  = NULL;
+	amroutine->amestimateparallelscan = tp_estimateparallelscan;
+	amroutine->aminitparallelscan	  = tp_initparallelscan;
+	amroutine->amparallelrescan		  = tp_parallelrescan;
 
 #if PG_VERSION_NUM >= 180000
 	amroutine->amtranslatestrategy = NULL;
@@ -138,7 +138,13 @@ tp_options(Datum reloptions, bool validate)
 			  .offset  = offsetof(TpOptions, k1)},
 			 {.optname = "b",
 			  .opttype = RELOPT_TYPE_REAL,
-			  .offset  = offsetof(TpOptions, b)}};
+			  .offset  = offsetof(TpOptions, b)},
+			 {.optname = "field_weights",
+			  .opttype = RELOPT_TYPE_STRING,
+			  .offset  = offsetof(TpOptions, field_weights_offset)},
+			 {.optname = "content_format",
+			  .opttype = RELOPT_TYPE_STRING,
+			  .offset  = offsetof(TpOptions, content_format_offset)}};
 
 	return (bytea *)build_reloptions(
 			reloptions,

@@ -15,8 +15,14 @@ Modern ranked text search for Postgres.
 - Parallel index builds for large tables
 - Supports partitioned tables
 - Best in class performance and scalability
+- **Advanced queries** (2.0.0+): prefix (`foo*`), phrase (`"foo bar"`),
+  field-scoped (`title:foo`), and fuzzy (`fuzzy_max_distance => 1`) —
+  all via `to_bm25query(..., grammar => true)`
+- **Highlighting**: `bm25_snippet()` for search result snippets with
+  byte-offset positions
+- **Parallel index scan** for 10M+ row indexes (up to 3x speedup)
 
-🚀 **Status**: v1.1.0 - Production ready.
+🚀 **Status**: v2.0.0 - Pre-production.
 
 ![Tapir and Friends](images/tapir_and_friends_v1.1.0.png)
 
@@ -46,6 +52,27 @@ cd pg_textsearch
 make
 make install # may need sudo
 ```
+
+### Docker
+
+A turnkey Docker image bakes Postgres 17 + pg_textsearch + the
+required `shared_preload_libraries` config and auto-creates the
+extension on first start.
+
+```sh
+# Build
+docker build -t pg_textsearch:1.2.0 .
+
+# Run
+docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=secret pg_textsearch:1.2.0
+
+# Connect
+psql -h localhost -U postgres
+```
+
+The extension is created automatically in the default `postgres`
+database. To use it in another database, run `CREATE EXTENSION
+pg_textsearch;` after `CREATE DATABASE`.
 
 ## Getting Started
 
@@ -100,6 +127,158 @@ LIMIT 5;
 Supported operations:
 - `text <@> 'query'` - Score text against a query (index auto-detected)
 - `text <@> bm25query` - Score text with explicit index specification
+
+### `to_bm25query` — the unified query builder
+
+All advanced query features go through `to_bm25query`:
+
+```sql
+to_bm25query(
+    query_text text,
+    index_name text DEFAULT NULL,
+    grammar    boolean DEFAULT false,
+    fuzzy_max_distance int DEFAULT 0
+)
+```
+
+| Parameter | Default | What it does |
+|-----------|---------|--------------|
+| `query_text` | (required) | The search query |
+| `index_name` | NULL | Index name for explicit binding |
+| `grammar` | false | Enable prefix `*`, phrase `""`, field-scope `field:`, escaping `\` |
+| `fuzzy_max_distance` | 0 | Levenshtein edit distance (0 = exact match) |
+
+When `grammar` is false (the default), the query text is tokenized via
+PostgreSQL's tsvector — colons, asterisks, and quotes are literal text.
+This is backward-compatible with v1.1.
+
+### Prefix queries
+
+Enable grammar to use prefix matching:
+
+```sql
+-- Returns docs containing 'quick', 'quickness', 'quickly', etc.
+SELECT * FROM documents
+ORDER BY content <@> to_bm25query('quic*', 'docs_idx', grammar => true)
+LIMIT 5;
+
+-- Programmatic builder (sets grammar internally):
+SELECT * FROM documents
+ORDER BY content <@> bm25_prefix('quic', 'docs_idx')
+LIMIT 5;
+
+-- Mix prefix and plain terms (implicit OR):
+SELECT * FROM documents
+ORDER BY content <@> to_bm25query('quic* search', 'docs_idx', grammar => true)
+LIMIT 5;
+```
+
+Prefix expansion is capped at `pg_textsearch.max_prefix_expansions`
+(default 50). `SET`-able per session.
+
+### Phrase queries
+
+Quoted tokens require exact ordered adjacency:
+
+```sql
+-- Phrase: must appear adjacent in order
+SELECT * FROM documents
+ORDER BY content <@> to_bm25query('"quick brown fox"', 'docs_idx', grammar => true)
+LIMIT 5;
+
+-- Phrase-prefix: last token is a prefix
+SELECT * FROM documents
+ORDER BY content <@> to_bm25query('"quick bro*"', 'docs_idx', grammar => true)
+LIMIT 5;
+```
+
+### Fuzzy queries
+
+Tolerate typos with Levenshtein distance expansion:
+
+```sql
+-- Edit distance 1: matches 'hello' from 'hllo'
+SELECT * FROM documents
+ORDER BY content <@> to_bm25query('hllo', 'docs_idx', fuzzy_max_distance => 1)
+LIMIT 5;
+
+-- Combine grammar + fuzzy
+SELECT * FROM documents
+ORDER BY content <@> to_bm25query('title:hllo', 'articles_idx',
+    grammar => true, fuzzy_max_distance => 1)
+LIMIT 5;
+```
+
+Bounded by `pg_textsearch.max_fuzzy_expansions` (default 50) and
+`pg_textsearch.max_fuzzy_distance` (default 2). Short terms below
+`pg_textsearch.min_fuzzy_term_len` (default 3) resolve exactly.
+
+### Field-scoped queries
+
+For multi-column indexes, scope clauses to specific fields:
+
+```sql
+CREATE INDEX articles_idx ON articles USING bm25 (title, description)
+    WITH (text_config = 'english');
+
+-- Only title must contain fox
+SELECT * FROM articles
+ORDER BY (title, description) <@> to_bm25query('title:fox', 'articles_idx', grammar => true)
+LIMIT 5;
+
+-- Group multiple clauses under one field
+SELECT * FROM articles
+ORDER BY (title, description) <@> to_bm25query('title:(hello world)', 'articles_idx', grammar => true)
+LIMIT 5;
+
+-- Field-scoped phrase + field-scoped term
+SELECT * FROM articles
+ORDER BY (title, description) <@> to_bm25query('title:"hello world" description:database', 'articles_idx', grammar => true)
+LIMIT 5;
+```
+
+Unqualified terms expand to OR across all indexed fields. Nested scopes
+like `title:(hello description:test)` are rejected.
+
+### Query grammar escaping
+
+Backslash escapes grammar characters when `grammar => true`:
+
+```text
+\:  literal colon       \*  literal asterisk
+\"  literal quote        \(  literal open paren
+\)  literal close paren  \\  literal backslash
+```
+
+### Highlighting
+
+Render search result snippets with matched terms highlighted:
+
+```sql
+SELECT
+    bm25_snippet(title, to_bm25query('hello', 'articles_idx'),
+        field_name => 'title') AS snippet,
+    bm25_snippet_positions(title, to_bm25query('hello', 'articles_idx'),
+        field_name => 'title') AS positions
+FROM articles
+ORDER BY (title, body) <@> to_bm25query('hello', 'articles_idx')
+LIMIT 10;
+```
+
+Positions are `int4range[]` byte offsets (`[start, end)`). Custom tags
+via `start_tag`/`end_tag`, fragment length via `max_num_chars`.
+
+JSON helper for multi-column indexes:
+
+```sql
+SELECT bm25_highlights(
+    to_bm25query('title:hello body:search*', 'articles_idx', grammar => true),
+    'articles_idx',
+    VARIADIC ARRAY[title, body])
+FROM articles
+ORDER BY (title, body) <@> to_bm25query('title:hello body:search*', 'articles_idx', grammar => true)
+LIMIT 10;
+```
 
 ### Verifying Index Usage
 
@@ -300,6 +479,8 @@ Function | Description
 --- | ---
 to_bm25query(text) → bm25query | Create bm25query without index name (for ORDER BY only)
 to_bm25query(text, text) → bm25query | Create bm25query with query text and index name
+bm25_fuzzy(text, int) → bm25query | Create a fuzzy bm25query without index name
+bm25_fuzzy(text, text, int) → bm25query | Create a fuzzy bm25query with query text and index name
 text <@> bm25query → double precision | BM25 scoring operator (returns negative scores)
 bm25query = bm25query → boolean | Equality comparison
 
@@ -400,6 +581,9 @@ Setting | Default | Description
 `pg_textsearch.memory_limit` | 2GB | Cap on shared memory used by memtables (0 = disable)
 `pg_textsearch.bulk_load_threshold` | 100000 | Terms per transaction before auto-spill (0 = disable)
 `pg_textsearch.memtable_spill_threshold` | 32000000 | **Deprecated.** Posting entries before auto-spill (0 = disable)
+`pg_textsearch.max_fuzzy_expansions` | 50 | Max concrete dictionary terms emitted per fuzzy token
+`pg_textsearch.max_fuzzy_distance` | 2 | Max edit distance accepted by `bm25_fuzzy`
+`pg_textsearch.min_fuzzy_term_len` | 3 | Shorter normalized terms resolve exactly instead of fuzzily
 
 > **`memtable_spill_threshold` is deprecated.** It was the original
 > mechanism for bounding memtable growth, triggering a spill when an

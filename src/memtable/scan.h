@@ -26,3 +26,20 @@ bool tp_memtable_search(
 		TpLocalIndexState *index_state,
 		TpVector		  *query_vector,
 		TpIndexMetaPage	   metap);
+
+/*
+ * Search using raw query text with grammar extensions (prefix '*').
+ * Used when the query contains tokens the existing tsvector-based
+ * path can't represent verbatim. Parses the text, tokenizes regular
+ * terms through the index's text_config, dictionary-expands prefix
+ * terms, and feeds the unified term list to BMW.
+ *
+ * Returns true on success (at least one result), false otherwise.
+ */
+bool tp_memtable_search_with_grammar(
+		IndexScanDesc	   scan,
+		TpLocalIndexState *index_state,
+		const char		  *query_text,
+		TpIndexMetaPage	   metap,
+		bool			   fuzzy,
+		uint8			   fuzzy_max_distance);

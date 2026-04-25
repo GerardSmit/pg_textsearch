@@ -13,3 +13,11 @@ extern bool tp_is_text_array_type(Oid typid);
 
 /* Flatten a text array into a single space-separated text */
 extern text *tp_flatten_text_array(Datum array_datum);
+
+/*
+ * Flatten a record (HeapTupleHeader) into a single space-separated
+ * text value. Only text-like fields (text, varchar, bpchar) and their
+ * arrays contribute; other field types are skipped. Returns empty
+ * text for empty records.
+ */
+extern text *tp_flatten_record(Datum record_datum);

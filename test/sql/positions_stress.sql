@@ -1,0 +1,119 @@
+-- Stress test for varint position encoding/decoding.
+-- Exercises the bounded varint decoder on:
+--   1. Large documents with many positions per term
+--   2. Phrase queries across spill and merge
+--   3. High term frequency docs (long varint chains)
+
+CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+
+-- ============================================================
+-- 1. Large documents: many positions per term
+-- ============================================================
+CREATE TABLE pos_stress(id serial, content text);
+
+-- Doc with 50 repetitions of 'alpha' (50 positions to encode)
+INSERT INTO pos_stress(content)
+SELECT string_agg('alpha beta gamma delta', ' ')
+FROM generate_series(1, 50);
+
+-- Doc with 100 repetitions of 'search' interleaved with filler
+INSERT INTO pos_stress(content)
+SELECT string_agg('search engine optimization web', ' ')
+FROM generate_series(1, 100);
+
+-- Short reference doc
+INSERT INTO pos_stress(content) VALUES ('alpha search match');
+
+CREATE INDEX pos_stress_idx ON pos_stress
+  USING bm25(content) WITH (text_config='english');
+
+-- Phrase query on high-frequency term (exercises position decoder)
+SELECT id FROM pos_stress
+ORDER BY content <@> to_bm25query('"alpha beta"', 'pos_stress_idx', grammar => true)
+LIMIT 5;
+
+SELECT id FROM pos_stress
+ORDER BY content <@> to_bm25query('"search engine"', 'pos_stress_idx', grammar => true)
+LIMIT 5;
+
+-- ============================================================
+-- 2. Spill to segment (positions encoded as varint in segment)
+-- ============================================================
+SELECT bm25_spill_index('pos_stress_idx');
+
+-- Same phrase queries must work from segment (varint decoding)
+SELECT id FROM pos_stress
+ORDER BY content <@> to_bm25query('"alpha beta"', 'pos_stress_idx', grammar => true)
+LIMIT 5;
+
+SELECT id FROM pos_stress
+ORDER BY content <@> to_bm25query('"search engine"', 'pos_stress_idx', grammar => true)
+LIMIT 5;
+
+-- ============================================================
+-- 3. Add more data and merge (exercises merge varint path)
+-- ============================================================
+INSERT INTO pos_stress(content)
+SELECT string_agg('alpha beta gamma search engine optimization', ' ')
+FROM generate_series(1, 30);
+
+SELECT bm25_spill_index('pos_stress_idx');
+
+-- Force merge by adding enough segments
+INSERT INTO pos_stress(content)
+SELECT 'filler document number ' || i FROM generate_series(1, 100) i;
+SELECT bm25_spill_index('pos_stress_idx');
+
+-- Phrase queries still work after merge
+SELECT count(*) > 0 AS phrase_works FROM (
+  SELECT id FROM pos_stress
+  ORDER BY content <@> to_bm25query('"alpha beta"', 'pos_stress_idx', grammar => true)
+  LIMIT 10
+) t;
+
+SELECT count(*) > 0 AS phrase_works FROM (
+  SELECT id FROM pos_stress
+  ORDER BY content <@> to_bm25query('"search engine"', 'pos_stress_idx', grammar => true)
+  LIMIT 10
+) t;
+
+-- ============================================================
+-- 4. Phrase-prefix across segments (another varint path)
+-- ============================================================
+SELECT count(*) >= 0 AS phrase_prefix_ok FROM (
+  SELECT id FROM pos_stress
+  ORDER BY content <@> to_bm25query('"alpha be*"', 'pos_stress_idx', grammar => true)
+  LIMIT 10
+) t;
+
+-- ============================================================
+-- 5. High doc count with positions (bulk varint encoding)
+-- ============================================================
+CREATE TABLE pos_bulk(id serial, content text);
+INSERT INTO pos_bulk(content)
+SELECT 'word_a word_b word_c word_d word_e term_' || (i % 20)::text ||
+       ' filler_' || (i % 50)::text
+FROM generate_series(1, 2000) i;
+
+CREATE INDEX pos_bulk_idx ON pos_bulk
+  USING bm25(content) WITH (text_config='simple');
+
+SELECT bm25_spill_index('pos_bulk_idx');
+
+-- Phrase query on bulk data
+SELECT count(*) > 0 AS bulk_phrase FROM (
+  SELECT id FROM pos_bulk
+  ORDER BY content <@> to_bm25query('"word_a word_b"', 'pos_bulk_idx', grammar => true)
+  LIMIT 20
+) t;
+
+-- Verify no crash on phrase-prefix over bulk
+SELECT count(*) >= 0 AS bulk_phrase_prefix FROM (
+  SELECT id FROM pos_bulk
+  ORDER BY content <@> to_bm25query('"word_a wor*"', 'pos_bulk_idx', grammar => true)
+  LIMIT 20
+) t;
+
+DROP TABLE pos_stress CASCADE;
+DROP TABLE pos_bulk CASCADE;
+DROP EXTENSION pg_textsearch CASCADE;

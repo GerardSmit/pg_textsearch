@@ -36,6 +36,7 @@
 #include "segment/io.h"
 #include "segment/merge.h"
 #include "segment/segment.h"
+#include "types/markup.h"
 
 /*
  * Per-segment state for VACUUM dead tuple tracking.
@@ -356,11 +357,13 @@ tp_vacuum_rebuild_segment(
 	uint64			 docs_added = 0;
 	uint64			 len_added	= 0;
 
+	uint8 vac_field_format = 0;
 	/* Get text config from metapage */
 	{
 		TpIndexMetaPage mp = tp_get_metapage(index);
 
-		text_config_oid = mp->text_config_oid;
+		text_config_oid	 = mp->text_config_oid;
+		vac_field_format = tp_metapage_field_format(mp, 0);
 		pfree(mp);
 	}
 
@@ -408,6 +411,7 @@ tp_vacuum_rebuild_segment(
 		TSVector		tsvector;
 		char		  **terms;
 		int32		   *frequencies;
+		uint32		  **positions = NULL;
 		int				term_count;
 		int				doc_length;
 
@@ -457,6 +461,9 @@ tp_vacuum_rebuild_segment(
 
 		document_text = DatumGetTextPP(idx_values[0]);
 
+		document_text = tp_normalize_markup(
+				document_text, (TpContentFormat)vac_field_format);
+
 		tsvector_datum = DirectFunctionCall2Coll(
 				to_tsvector_byid,
 				InvalidOid,
@@ -465,7 +472,7 @@ tp_vacuum_rebuild_segment(
 		tsvector = DatumGetTSVector(tsvector_datum);
 
 		doc_length = tp_extract_terms_from_tsvector(
-				tsvector, &terms, &frequencies, &term_count);
+				tsvector, &terms, &frequencies, &positions, &term_count);
 
 		MemoryContextSwitchTo(old_ctx);
 
@@ -475,6 +482,7 @@ tp_vacuum_rebuild_segment(
 					build_ctx,
 					terms,
 					frequencies,
+					positions,
 					term_count,
 					doc_length,
 					&ctid);
@@ -595,7 +603,6 @@ tp_vacuum_replace_segment(
 			/* Update prev's next_segment pointer. */
 			Page		prev_page;
 			char	   *prev_content;
-			uint32		prev_version;
 			BlockNumber new_next;
 
 			prev_buf = ReadBuffer(index, prev_root);
@@ -606,22 +613,8 @@ tp_vacuum_replace_segment(
 
 			new_next = (new_root != InvalidBlockNumber) ? new_root : old_next;
 
-			/*
-			 * The previous segment may still be on an older on-disk
-			 * format.  V3 uses uint32 offsets and places next_segment
-			 * at byte 28; V4/V5 use uint64 offsets with 4 bytes of
-			 * padding before data_size, placing next_segment at byte
-			 * 36.  Write at the offset matching the on-disk version
-			 * so we don't clobber adjacent fields.  magic/version
-			 * live at the same bytes in every version, so reading
-			 * version via the V5 struct is safe.
-			 */
 			prev_content = PageGetContents(prev_page);
-			prev_version = ((TpSegmentHeader *)prev_content)->version;
-			if (prev_version <= TP_SEGMENT_FORMAT_VERSION_3)
-				((TpSegmentHeaderV3 *)prev_content)->next_segment = new_next;
-			else
-				((TpSegmentHeader *)prev_content)->next_segment = new_next;
+			((TpSegmentHeader *)prev_content)->next_segment = new_next;
 
 			if (new_root == InvalidBlockNumber)
 				meta_ptr->level_counts[level]--;

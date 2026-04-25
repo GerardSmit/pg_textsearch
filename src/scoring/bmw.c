@@ -405,7 +405,7 @@ compute_bm25_score(
  * Memtable has no skip index, so we score all postings exhaustively.
  * Uses the TpDataSource interface for clean abstraction.
  */
-static void
+void
 score_memtable_single_term(
 		TpTopKHeap		  *heap,
 		TpLocalIndexState *local_state,
@@ -435,26 +435,36 @@ score_memtable_single_term(
 		return;
 	}
 
-	/* Score each posting */
-	for (i = 0; i < postings->count; i++)
 	{
-		ItemPointerData *ctid = &postings->ctids[i];
-		int32			 tf	  = postings->frequencies[i];
-		int32			 doc_len;
-		float4			 score;
+		/* BM25F: per-field doc length for tagged terms */
+		int			  field_idx = -1;
+		unsigned char first		= (unsigned char)term[0];
+		if (first >= TP_FIELD_TAG_BASE)
+			field_idx = first - TP_FIELD_TAG_BASE;
 
-		/* Get document length */
-		doc_len = tp_source_get_doc_length(source, ctid);
-		if (doc_len <= 0)
-			doc_len = 1; /* Fallback for missing entries */
+		for (i = 0; i < postings->count; i++)
+		{
+			ItemPointerData *ctid = &postings->ctids[i];
+			int32			 tf	  = postings->frequencies[i];
+			int32			 doc_len;
+			float4			 score;
 
-		score = compute_bm25_score(idf, tf, doc_len, k1, b, avg_doc_len);
+			if (field_idx >= 0)
+				doc_len = tp_source_get_doc_field_length(
+						source, ctid, field_idx);
+			else
+				doc_len = tp_source_get_doc_length(source, ctid);
+			if (doc_len <= 0)
+				doc_len = 1; /* Fallback for missing entries */
 
-		if (!tp_topk_dominated(heap, score))
-			tp_topk_add_memtable(heap, *ctid, score);
+			score = compute_bm25_score(idf, tf, doc_len, k1, b, avg_doc_len);
 
-		if (stats)
-			stats->memtable_docs++;
+			if (!tp_topk_dominated(heap, score))
+				tp_topk_add_memtable(heap, *ctid, score);
+
+			if (stats)
+				stats->memtable_docs++;
+		}
 	}
 
 	tp_source_free_postings(source, postings);
@@ -462,9 +472,12 @@ score_memtable_single_term(
 }
 
 /*
- * Score segment postings for a single term using BMW.
+ * Score segment postings for a single term using BMW.  Public so
+ * parallel-scan workers (parallel scan) can drive per-segment scoring
+ * directly without going through tp_score_single_term_bmw's
+ * memtable-and-iterate-all-segments wrapper.
  */
-static void
+void
 score_segment_single_term_bmw(
 		TpTopKHeap		*heap,
 		TpSegmentReader *reader,
@@ -566,6 +579,56 @@ score_segment_single_term_bmw(
 	tp_segment_posting_iterator_free(&iter);
 }
 
+/*
+ * Walk the segment chains rooted in metap->level_heads and materialize
+ * a flat array of segment-root BlockNumbers.  Caller pfrees *out_roots.
+ * Returns 0 when there are no segments.
+ *
+ * This is the parallel-friendly form: workers in parallel scan claim
+ * indices into the array via an atomic counter, no chain walking.
+ * Serial callers iterate the array sequentially.
+ *
+ * Cost: one tp_segment_open per segment to read next_segment from
+ * its header — N buffer reads on top of what scoring already does.
+ * Negligible relative to BMW scoring of those segments.
+ */
+int
+tp_collect_segment_roots(
+		Relation index, TpIndexMetaPage metap, BlockNumber **out_roots)
+{
+	BlockNumber *roots	  = NULL;
+	int			 count	  = 0;
+	int			 capacity = 0;
+	int			 level;
+
+	for (level = 0; level < TP_MAX_LEVELS; level++)
+	{
+		BlockNumber seg_head = metap->level_heads[level];
+
+		while (seg_head != InvalidBlockNumber)
+		{
+			TpSegmentReader *reader;
+
+			if (count >= capacity)
+			{
+				int new_cap = capacity ? capacity * 2 : 16;
+				roots		= roots ? repalloc(roots, new_cap * sizeof(*roots))
+									: palloc(new_cap * sizeof(*roots));
+				capacity	= new_cap;
+			}
+
+			roots[count++] = seg_head;
+
+			reader	 = tp_segment_open(index, seg_head);
+			seg_head = reader->header->next_segment;
+			tp_segment_close(reader);
+		}
+	}
+
+	*out_roots = roots;
+	return count;
+}
+
 int
 tp_score_single_term_bmw(
 		TpLocalIndexState *local_state,
@@ -582,8 +645,9 @@ tp_score_single_term_bmw(
 {
 	TpTopKHeap		heap;
 	TpIndexMetaPage metap;
-	BlockNumber		level_heads[TP_MAX_LEVELS];
-	int				level;
+	BlockNumber	   *roots;
+	int				num_roots;
+	int				i;
 	int				result_count;
 
 	/* Initialize stats */
@@ -597,28 +661,23 @@ tp_score_single_term_bmw(
 	score_memtable_single_term(
 			&heap, local_state, term, idf, k1, b, avg_doc_len, stats);
 
-	/* Get segment level heads from metapage */
-	metap = tp_get_metapage(index);
-	for (level = 0; level < TP_MAX_LEVELS; level++)
-		level_heads[level] = metap->level_heads[level];
+	/* Materialize segment-root list once, then score each in turn. */
+	metap	  = tp_get_metapage(index);
+	num_roots = tp_collect_segment_roots(index, metap, &roots);
 	pfree(metap);
 
-	/* Score each segment level with BMW */
-	for (level = 0; level < TP_MAX_LEVELS; level++)
+	for (i = 0; i < num_roots; i++)
 	{
-		BlockNumber seg_head = level_heads[level];
+		TpSegmentReader *reader = tp_segment_open(index, roots[i]);
 
-		while (seg_head != InvalidBlockNumber)
-		{
-			TpSegmentReader *reader = tp_segment_open(index, seg_head);
+		score_segment_single_term_bmw(
+				&heap, reader, term, idf, k1, b, avg_doc_len, stats);
 
-			score_segment_single_term_bmw(
-					&heap, reader, term, idf, k1, b, avg_doc_len, stats);
-
-			seg_head = reader->header->next_segment;
-			tp_segment_close(reader);
-		}
+		tp_segment_close(reader);
 	}
+
+	if (roots)
+		pfree(roots);
 
 	/* Resolve CTIDs for segment results before extraction */
 	tp_topk_resolve_ctids(&heap, index);
@@ -638,25 +697,7 @@ tp_score_single_term_bmw(
  * ------------------------------------------------------------
  */
 
-/*
- * Per-term state for multi-term BMW scoring.
- */
-typedef struct TpTermState
-{
-	const char *term;
-	float4		idf;
-	int32		query_freq; /* Query term frequency (for boosting) */
-
-	/* Global maximum score across all blocks (for WAND pivot) */
-	float4 max_score;
-
-	/* Segment-specific state (reset per segment) */
-	bool					 found; /* Term found in current segment */
-	TpSegmentPostingIterator iter;	/* Iterator (contains dict_entry) */
-	float4 *block_max_scores;		/* Pre-computed block max scores */
-	uint32 *block_last_doc_ids;		/* Cached last_doc_id per block */
-	uint32	cur_doc_id;				/* Cached current doc ID */
-} TpTermState;
+/* TpTermState is declared in bmw.h. */
 
 /*
  * Refresh cached doc ID from iterator state.
@@ -734,18 +775,29 @@ score_memtable_multi_term(
 			ItemPointerData	   *ctid = &postings->ctids[i];
 			int32				tf	 = postings->frequencies[i];
 			int32				doc_len;
+			float4				term_avgdl;
 			float4				term_score;
 			DocumentScoreEntry *entry;
 			bool				found;
 
-			/* Get document length */
-			doc_len = tp_source_get_doc_length(source, ctid);
+			/* BM25F: per-field length for tagged terms */
+			if (ts->field_idx >= 0)
+			{
+				doc_len = tp_source_get_doc_field_length(
+						source, ctid, ts->field_idx);
+				term_avgdl = ts->avg_doc_len;
+			}
+			else
+			{
+				doc_len	   = tp_source_get_doc_length(source, ctid);
+				term_avgdl = avg_doc_len;
+			}
 			if (doc_len <= 0)
 				doc_len = 1;
 
 			/* Compute BM25 term contribution */
 			term_score = compute_bm25_score(
-								 ts->idf, tf, doc_len, k1, b, avg_doc_len) *
+								 ts->idf, tf, doc_len, k1, b, term_avgdl) *
 						 ts->query_freq;
 
 			/* Accumulate in hash table */
@@ -989,7 +1041,11 @@ init_segment_term_states(
 						block_idx,
 						&skip_cache[block_idx]);
 				ts->block_max_scores[block_idx] = tp_compute_block_max_score(
-						&skip_cache[block_idx], ts->idf, k1, b, avg_doc_len);
+						&skip_cache[block_idx],
+						ts->idf,
+						k1,
+						b,
+						ts->avg_doc_len);
 				ts->block_last_doc_ids[block_idx] =
 						skip_cache[block_idx].last_doc_id;
 
@@ -1364,7 +1420,7 @@ score_pivot_document(
 							 (int32)decode_fieldnorm(bp->fieldnorm),
 							 k1,
 							 b,
-							 avg_doc_len) *
+							 ts->avg_doc_len) *
 					 ts->query_freq;
 		doc_score += term_score;
 	}
@@ -1384,7 +1440,7 @@ score_pivot_document(
  * at the pivot still beat the threshold, and uses Tantivy-style
  * skip advancement when they don't.
  */
-static void
+void
 score_segment_multi_term_bmw(
 		TpTopKHeap		*heap,
 		TpSegmentReader *reader,
@@ -1501,6 +1557,7 @@ tp_score_multi_term_bmw(
 		int				   term_count,
 		int32			  *query_freqs,
 		float4			  *idfs,
+		const float4	  *avg_doc_lens,
 		float4			   k1,
 		float4			   b,
 		float4			   avg_doc_len,
@@ -1511,9 +1568,7 @@ tp_score_multi_term_bmw(
 {
 	TpTopKHeap		heap;
 	TpIndexMetaPage metap;
-	BlockNumber		level_heads[TP_MAX_LEVELS];
 	TpTermState	  **terms;
-	int				level;
 	int				result_count;
 	int				i;
 
@@ -1528,30 +1583,41 @@ tp_score_multi_term_bmw(
 	terms = palloc(term_count * sizeof(TpTermState *));
 	for (i = 0; i < term_count; i++)
 	{
+		unsigned char first;
+		int			  fidx = -1;
+
 		terms[i]			 = palloc(sizeof(TpTermState));
 		terms[i]->term		 = query_terms[i];
 		terms[i]->idf		 = idfs[i];
 		terms[i]->query_freq = query_freqs[i];
+
+		/* BM25F: derive field_idx from tag byte; pick per-term avgdl */
+		first = (unsigned char)query_terms[i][0];
+		if (first >= TP_FIELD_TAG_BASE)
+			fidx = first - TP_FIELD_TAG_BASE;
+		terms[i]->field_idx	  = fidx;
+		terms[i]->avg_doc_len = (avg_doc_lens != NULL) ? avg_doc_lens[i]
+													   : avg_doc_len;
+		if (terms[i]->avg_doc_len <= 0.0f)
+			terms[i]->avg_doc_len = avg_doc_len;
 	}
 
 	/* Score memtable (exhaustive - no skip index) */
 	score_memtable_multi_term(
 			&heap, local_state, terms, term_count, k1, b, avg_doc_len, stats);
 
-	/* Get segment level heads from metapage */
+	/* Materialize segment-root list once, then score each in turn. */
 	metap = tp_get_metapage(index);
-	for (level = 0; level < TP_MAX_LEVELS; level++)
-		level_heads[level] = metap->level_heads[level];
-	pfree(metap);
-
-	/* Score each segment with block-based BMW */
-	for (level = 0; level < TP_MAX_LEVELS; level++)
 	{
-		BlockNumber seg_head = level_heads[level];
+		BlockNumber *roots;
+		int num_roots = tp_collect_segment_roots(index, metap, &roots);
+		int r;
 
-		while (seg_head != InvalidBlockNumber)
+		pfree(metap);
+
+		for (r = 0; r < num_roots; r++)
 		{
-			TpSegmentReader *reader = tp_segment_open(index, seg_head);
+			TpSegmentReader *reader = tp_segment_open(index, roots[r]);
 
 			score_segment_multi_term_bmw(
 					&heap,
@@ -1563,9 +1629,11 @@ tp_score_multi_term_bmw(
 					avg_doc_len,
 					stats);
 
-			seg_head = reader->header->next_segment;
 			tp_segment_close(reader);
 		}
+
+		if (roots)
+			pfree(roots);
 	}
 
 	for (i = 0; i < term_count; i++)

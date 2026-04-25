@@ -61,7 +61,7 @@ Package: ${PACKAGE_NAME}
 Version: ${DEB_VERSION}
 Architecture: ${DEB_ARCH}
 Maintainer: Timescale <hello@timescale.com>
-Depends: timescaledb-2-postgresql-${PG_VERSION} | postgresql-${PG_VERSION}
+Depends: timescaledb-2-postgresql-${PG_VERSION} | postgresql-${PG_VERSION}, libxml2
 Section: database
 Priority: optional
 Homepage: https://github.com/timescale/pg_textsearch

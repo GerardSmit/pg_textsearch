@@ -19,12 +19,35 @@
  * Page format versions - bump when on-disk format changes.
  * Each page type has its own version for independent evolution.
  */
-#define TP_METAPAGE_VERSION \
-	6 /* Bumped for BMW block_max_norm fix (min not max) */
+#define TP_METAPAGE_VERSION                                                \
+	1							/* Clean-slate format; pre-2.0 indexes are \
+								 * not readable and must be REINDEXed. */
 #define TP_DOCID_PAGE_VERSION 1 /* Initial version */
 #define TP_PAGE_INDEX_VERSION 1 /* Page index format version */
 
 #define TP_METAPAGE_BLKNO 0
+
+/*
+ * Multi-column field registry (Phase 6.1 metapage extensions).
+ *
+ * Terms from multi-column indexes are stored in the term dictionary
+ * prefixed with a single tag byte identifying which column they came
+ * from. Tag byte = 0x80 + field_idx so the high bit distinguishes
+ * tagged terms from raw ASCII tokens in dumps; strcmp / memcmp
+ * ordering remains stable and field-0 terms sort contiguously before
+ * field-1 etc. Limits TP_MAX_FIELDS to 127 (= 255 - 0x80), which is
+ * far beyond any practical schema.
+ */
+#define TP_MAX_FIELDS		  16
+#define TP_MAX_FIELD_NAME_LEN 63 /* 63 chars + null terminator = 64B slot */
+#define TP_FIELD_TAG_BASE	  0x80
+
+/* Encode a field index into a single tag byte (suitable for strcmp). */
+static inline unsigned char
+tp_field_tag_byte(int field_idx)
+{
+	return (unsigned char)(TP_FIELD_TAG_BASE + field_idx);
+}
 
 /* Segment hierarchy configuration */
 #define TP_MAX_LEVELS				  8 /* Supports 8^8 = 16M segments */

@@ -43,7 +43,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y flex bison build-essential libssl-dev \
-          libreadline-dev systemd-coredump gdb ${{ env.extra_packages }}
+          libreadline-dev libxml2-dev pkg-config systemd-coredump gdb ${{ env.extra_packages }}
 
     - name: Checkout
       uses: actions/checkout@v4

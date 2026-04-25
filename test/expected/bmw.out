@@ -2,7 +2,7 @@
 -- Tests the top-k optimization for both single-term and multi-term queries
 -- Setup: Create extension
 CREATE EXTENSION pg_textsearch;
-INFO:  pg_textsearch v1.1.0
+INFO:  pg_textsearch v2.0.0
 -- Force index scan so ORDER BY uses the BM25 index (small tables
 -- would otherwise prefer seq scan, returning non-matching rows)
 SET enable_seqscan = off;
@@ -345,7 +345,7 @@ FROM generate_series(501, 1000) i;
 SELECT bm25_spill_index('bmw_hybrid_idx');
  bm25_spill_index 
 ------------------
-                8
+               10
 (1 row)
 
 -- Insert recent data (stays in memtable)
@@ -769,7 +769,7 @@ FROM generate_series(301, 600) i;
 SELECT bm25_spill_index('bmw_multiseg_idx');
  bm25_spill_index 
 ------------------
-                6
+                7
 (1 row)
 
 -- Batch 3 -> memtable (not spilled)

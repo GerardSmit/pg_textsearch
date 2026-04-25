@@ -20,6 +20,7 @@
 #include "memtable/memtable.h"
 #include "memtable/posting.h"
 #include "memtable/stringtable.h"
+#include "types/fuzzy.h"
 
 /*
  * Get string length from key.
@@ -375,6 +376,173 @@ tp_get_posting_list(TpLocalIndexState *local_state, const char *term)
 }
 
 /*
+ * Collect memtable terms with the given prefix, capped at max_terms.
+ *
+ * dshash iteration order is unspecified, so we walk every term and
+ * test for prefix match. For consistent test output, the caller is
+ * responsible for sorting the merged result (tp_expand_prefix does
+ * this via sorted insertion).
+ */
+void
+tp_memtable_collect_prefix_terms(
+		TpLocalIndexState *local_state,
+		const char		  *prefix,
+		int				   max_terms,
+		char			***out_terms,
+		int				  *out_count)
+{
+	TpMemtable		  *memtable;
+	dshash_table	  *string_table;
+	dshash_seq_status  status;
+	TpStringHashEntry *entry;
+	size_t			   prefix_len;
+	char			 **terms	= NULL;
+	int				   count	= 0;
+	int				   capacity = 0;
+
+	*out_terms = NULL;
+	*out_count = 0;
+
+	Assert(local_state != NULL);
+	Assert(prefix != NULL);
+
+	if (max_terms <= 0)
+		return;
+
+	prefix_len = strlen(prefix);
+	if (prefix_len == 0)
+		return;
+
+	memtable = get_memtable(local_state);
+	if (!memtable)
+		return;
+	if (memtable->string_hash_handle == DSHASH_HANDLE_INVALID)
+		return;
+
+	string_table = tp_string_table_attach(
+			local_state->dsa, memtable->string_hash_handle);
+	if (!string_table)
+		return;
+
+	/*
+	 * dshash_seq_init/next manages partition locks internally — do NOT
+	 * call dshash_release_lock on entries returned here. Locks are
+	 * released by dshash_seq_term().
+	 */
+	dshash_seq_init(&status, string_table, false);
+	while ((entry = (TpStringHashEntry *)dshash_seq_next(&status)) != NULL)
+	{
+		const char *term;
+		size_t		term_len;
+
+		if (count >= max_terms)
+			break;
+
+		if (!DsaPointerIsValid(entry->key.term.dp))
+			continue;
+
+		term = (const char *)
+				dsa_get_address(local_state->dsa, entry->key.term.dp);
+		term_len = strlen(term);
+
+		if (term_len >= prefix_len && memcmp(term, prefix, prefix_len) == 0)
+		{
+			char *copy;
+
+			if (count >= capacity)
+			{
+				int new_cap = (capacity == 0) ? 8 : capacity * 2;
+				if (new_cap > max_terms)
+					new_cap = max_terms;
+				if (terms == NULL)
+					terms = palloc(new_cap * sizeof(char *));
+				else
+					terms = repalloc(terms, new_cap * sizeof(char *));
+				capacity = new_cap;
+			}
+
+			copy = palloc(term_len + 1);
+			memcpy(copy, term, term_len + 1);
+			terms[count++] = copy;
+		}
+	}
+	dshash_seq_term(&status);
+	dshash_detach(string_table);
+
+	*out_terms = terms;
+	*out_count = count;
+}
+
+void
+tp_memtable_collect_fuzzy_terms(
+		TpLocalIndexState *local_state,
+		const char		  *query_term,
+		int				   max_distance,
+		int				   max_terms,
+		bool			   prefix,
+		TpFuzzyCandidate **out_candidates,
+		int				  *out_count)
+{
+	TpMemtable		  *memtable;
+	dshash_table	  *string_table;
+	dshash_seq_status  status;
+	TpStringHashEntry *entry;
+	TpFuzzyCandidate  *candidates = NULL;
+	int				   count	  = 0;
+	int				   capacity	  = 0;
+
+	*out_candidates = NULL;
+	*out_count		= 0;
+
+	Assert(local_state != NULL);
+	Assert(query_term != NULL);
+
+	if (max_terms <= 0 || max_distance < 0)
+		return;
+
+	memtable = get_memtable(local_state);
+	if (!memtable)
+		return;
+	if (memtable->string_hash_handle == DSHASH_HANDLE_INVALID)
+		return;
+
+	string_table = tp_string_table_attach(
+			local_state->dsa, memtable->string_hash_handle);
+	if (!string_table)
+		return;
+
+	dshash_seq_init(&status, string_table, false);
+	while ((entry = (TpStringHashEntry *)dshash_seq_next(&status)) != NULL)
+	{
+		const char *term;
+		uint8		distance;
+
+		if (!DsaPointerIsValid(entry->key.term.dp))
+			continue;
+
+		term = (const char *)
+				dsa_get_address(local_state->dsa, entry->key.term.dp);
+
+		if (tp_fuzzy_match_term(
+					query_term, term, max_distance, prefix, &distance))
+		{
+			tp_fuzzy_candidates_insert(
+					&candidates,
+					&count,
+					&capacity,
+					pstrdup(term),
+					distance,
+					max_terms);
+		}
+	}
+	dshash_seq_term(&status);
+	dshash_detach(string_table);
+
+	*out_candidates = candidates;
+	*out_count		= count;
+}
+
+/*
  * Ensure the memtable's string hash table is initialized.
  *
  * Must be called under LW_EXCLUSIVE on the per-index lock.
@@ -518,26 +686,40 @@ tp_add_document_terms(
 		ItemPointer		   ctid,
 		char			 **terms,
 		int32			  *frequencies,
+		uint32			 **positions,
 		int				   term_count,
-		int32			   doc_length)
+		int32			   doc_length,
+		const int32		  *field_lengths,
+		int				   num_fields)
 {
 	int i;
 
 	for (i = 0; i < term_count; i++)
 	{
 		TpPostingList *posting_list;
-		int32		   frequency = frequencies[i];
+		int32		   frequency	  = frequencies[i];
+		const uint32  *term_positions = (positions != NULL) ? positions[i]
+															: NULL;
 
 		/* Get or create posting list for this term */
 		posting_list = tp_get_or_create_posting_list(local_state, terms[i]);
 
 		/* Add document entry to posting list */
 		tp_add_document_to_posting_list(
-				local_state, posting_list, ctid, frequency);
+				local_state, posting_list, ctid, frequency, term_positions);
 	}
 
 	/* Store document length in the document length table */
 	tp_store_document_length(local_state, ctid, doc_length);
+
+	/*
+	 * Phase 6.1d: for multi-col indexes, also stash per-field lengths
+	 * in a separate dshash so segment spill can encode per-field
+	 * fieldnorms inline on tagged-term postings.
+	 */
+	if (field_lengths != NULL && num_fields > 1)
+		tp_store_document_field_lengths(
+				local_state, ctid, doc_length, field_lengths, num_fields);
 
 	/*
 	 * Update corpus statistics.
@@ -547,6 +729,14 @@ tp_add_document_terms(
 	 */
 	pg_atomic_fetch_add_u32(&local_state->shared->total_docs, 1);
 	pg_atomic_fetch_add_u64(&local_state->shared->total_len, doc_length);
+	if (field_lengths != NULL)
+	{
+		int fi;
+		for (fi = 0; fi < num_fields && fi < TP_MAX_FIELDS; fi++)
+			pg_atomic_fetch_add_u64(
+					&local_state->shared->total_len_per_field[fi],
+					field_lengths[fi]);
+	}
 
 	/* Track terms added in this transaction for bulk load detection */
 	local_state->terms_added_this_xact += term_count;

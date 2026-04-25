@@ -361,3 +361,131 @@ tp_compressed_block_size(const uint8 *compressed, uint32 count)
 
 	return sizeof(TpCompressedBlockHeader) + doc_id_bytes + freq_bytes + count;
 }
+
+/*
+ * V7 positions: LEB128 varint-delta encoding.
+ *
+ * Each byte carries 7 payload bits + 1 continuation bit (MSB).
+ * uint32 worst case: 5 bytes (5 × 7 = 35 > 32). Most English-text
+ * deltas are 1-3 and encode as 1 byte each.
+ */
+
+uint32
+tp_positions_max_encoded_bytes(uint32 count)
+{
+	return count * 5;
+}
+
+static inline uint32
+encode_varint(uint32 value, uint8 *out)
+{
+	uint32 i = 0;
+	while (value >= 128)
+	{
+		out[i++] = (uint8)(value | 0x80);
+		value >>= 7;
+	}
+	out[i++] = (uint8)value;
+	return i;
+}
+
+static inline uint32
+decode_varint(const uint8 *in, uint32 in_len, uint32 *value_out)
+{
+	uint32 value = 0;
+	uint32 i	 = 0;
+
+	if (in_len == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("truncated varint: no bytes available")));
+
+	for (;;)
+	{
+		uint8 byte = in[i];
+
+		if (i < 4)
+		{
+			value |= (uint32)(byte & 0x7F) << (i * 7);
+		}
+		else if (i == 4)
+		{
+			/* 5th byte: only the low 4 bits may be set. */
+			if (byte & 0x70)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("overlong varint: 5th byte has "
+								"upper payload bits set")));
+			value |= (uint32)(byte & 0x0F) << 28;
+		}
+		i++;
+
+		if ((byte & 0x80) == 0)
+			break;
+
+		/* Continuation after the 5th byte is invalid. */
+		if (i >= 5)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("overlong varint: continuation "
+							"after 5th byte")));
+
+		if (i >= in_len)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("truncated varint at byte %u", i)));
+	}
+
+	*value_out = value;
+	return i;
+}
+
+uint32
+tp_positions_encode_varint_delta(
+		const uint32 *positions, uint32 count, uint8 *out)
+{
+	uint32 bytes = 0;
+	uint32 prev	 = 0;
+	uint32 i;
+
+	if (count == 0)
+		return 0;
+
+	/* First position encoded absolutely; subsequent as forward deltas. */
+	bytes += encode_varint(positions[0], out + bytes);
+	prev = positions[0];
+	for (i = 1; i < count; i++)
+	{
+		uint32 delta = (positions[i] >= prev) ? (positions[i] - prev) : 0;
+		bytes += encode_varint(delta, out + bytes);
+		prev = positions[i];
+	}
+	return bytes;
+}
+
+uint32
+tp_positions_decode_varint_delta(
+		const uint8 *in, uint32 in_len, uint32 count, uint32 *out)
+{
+	uint32 bytes = 0;
+	uint32 prev	 = 0;
+	uint32 i;
+
+	if (count == 0)
+		return 0;
+
+	bytes += decode_varint(in + bytes, in_len - bytes, &out[0]);
+	prev = out[0];
+	for (i = 1; i < count; i++)
+	{
+		uint32 delta;
+		if (bytes > in_len)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("varint position stream overrun")));
+		bytes += decode_varint(in + bytes, in_len - bytes, &delta);
+		out[i] = prev + delta;
+		prev   = out[i];
+	}
+	return bytes;
+}
