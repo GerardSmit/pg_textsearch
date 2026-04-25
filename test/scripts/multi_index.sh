@@ -707,8 +707,7 @@ test_concurrent_spills() {
 test_query_during_spill() {
     log "Test 6: Query during cross-index spill"
 
-    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.memory_limit
-                       = '4MB';"
+    run_sql_quiet "ALTER SYSTEM SET pg_textsearch.bulk_load_threshold = 5000;"
     reload_conf
 
     # Set up two tables with indexes.
