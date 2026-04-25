@@ -640,7 +640,7 @@ test_concurrent_spills() {
             SELECT 'idx${i}_term_' || j || ' '
                    || repeat('fill_', 8)
             FROM generate_series(1, 2000) j;
-        " >/dev/null 2>&1 &
+        " >/dev/null 2>/tmp/spill_test5_${i}.err &
         pids+=($!)
     done
 
@@ -652,6 +652,11 @@ test_concurrent_spills() {
     done
 
     if [ "$any_fail" -eq 1 ]; then
+        for i in $(seq 1 $N); do
+            if [ -s /tmp/spill_test5_${i}.err ]; then
+                log "Test 5 backend $i stderr: $(cat /tmp/spill_test5_${i}.err)"
+            fi
+        done
         fail "Test 5a: one or more concurrent inserts failed"
     else
         pass "Test 5a: all concurrent inserts completed"

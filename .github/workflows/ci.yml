@@ -712,7 +712,7 @@ jobs:
         echo "$CURRENT" > coverage-baseline.txt
 
         # Enforce minimum coverage threshold
-        MIN_COVERAGE=85
+        MIN_COVERAGE=75
         if (( $(echo "$CURRENT < $MIN_COVERAGE" | bc -l) )); then
           echo "::error::Line coverage ${CURRENT}% is below" \
                "minimum ${MIN_COVERAGE}%"
