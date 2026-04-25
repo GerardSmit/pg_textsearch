@@ -398,6 +398,35 @@ RETURNS jsonb
 AS 'MODULE_PATHNAME', 'bm25_highlights'
 LANGUAGE C STABLE PARALLEL SAFE;
 
+-- Zero-arg overloads: query, index, and columns inferred from the active
+-- bm25 index scan. The planner rewrites these to the explicit forms.
+-- If no scan is active, they error with a helpful message.
+
+CREATE FUNCTION @extschema@.bm25_highlights()
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'bm25_highlights_auto'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_snippet()
+RETURNS text
+AS 'MODULE_PATHNAME', 'bm25_snippet_auto'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_snippet(field_name text)
+RETURNS text
+AS 'MODULE_PATHNAME', 'bm25_snippet_field'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_snippet_positions()
+RETURNS int4range[]
+AS 'MODULE_PATHNAME', 'bm25_snippet_positions_auto'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.bm25_snippet_positions(field_name text)
+RETURNS int4range[]
+AS 'MODULE_PATHNAME', 'bm25_snippet_positions_field'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
 -- Display version info
 DO $$
 BEGIN

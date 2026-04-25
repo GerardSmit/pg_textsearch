@@ -152,6 +152,39 @@ FROM highlight_docs WHERE id = 3;
  {"body": {"matches": [], "snippet": null, "positions": []}, "title": {"matches": [], "snippet": "", "positions": []}}
 (1 row)
 
+-- Zero-arg bm25_highlights(): query, index, columns inferred from scan.
+SELECT bm25_highlights()
+FROM highlight_docs
+ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
+LIMIT 2;
+                                                                                                                                                                     bm25_highlights                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"body": {"matches": [{"end": 5, "term": "hello", "start": 0, "match_type": "exact", "matched_text": "Hello"}], "snippet": "<b>Hello</b> brave world", "positions": [[0, 5]]}, "title": {"matches": [{"end": 5, "term": "hello", "start": 0, "match_type": "exact", "matched_text": "Hello"}], "snippet": "<b>Hello</b> world", "positions": [[0, 5]]}}
+ {"body": {"matches": [], "snippet": "", "positions": []}, "title": {"matches": [{"end": 5, "term": "hello", "start": 0, "match_type": "exact", "matched_text": "Hello"}, {"end": 11, "term": "hello", "start": 6, "match_type": "exact", "matched_text": "hello"}], "snippet": "<b>Hello</b> <b>hello</b>", "positions": [[0, 5], [6, 11]]}}
+(2 rows)
+
+-- bm25_snippet('field_name'): multi-col, field resolves to column.
+SELECT bm25_snippet('title')
+FROM highlight_docs
+ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
+LIMIT 2;
+       bm25_snippet        
+---------------------------
+ <b>Hello</b> world
+ <b>Hello</b> <b>hello</b>
+(2 rows)
+
+-- bm25_snippet_positions('field_name')
+SELECT bm25_snippet_positions('title')
+FROM highlight_docs
+ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
+LIMIT 2;
+ bm25_snippet_positions 
+------------------------
+ {"[0,5)"}
+ {"[0,5)","[6,11)"}
+(2 rows)
+
 DROP TABLE highlight_docs;
 DROP EXTENSION pg_textsearch CASCADE;
 -- =============================================================

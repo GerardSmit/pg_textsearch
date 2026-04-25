@@ -17,6 +17,7 @@
 #include <catalog/indexing.h>
 #include <catalog/namespace.h>
 #include <catalog/pg_am.h>
+#include <catalog/pg_collation_d.h>
 #include <catalog/pg_index.h>
 #include <catalog/pg_inherits.h>
 #include <catalog/pg_opclass.h>
@@ -1414,6 +1415,556 @@ plan_has_bm25_indexscan(Plan *plan, BM25OidCache *oids)
 }
 
 /*
+ * Context extracted from a BM25 IndexScan for highlight rewriting.
+ */
+typedef struct BM25ScanInfo
+{
+	Oid		   index_oid;
+	Index	   scan_relid;
+	Const	  *query_const; /* bm25query Const from ORDER BY */
+	int		   nkeys;
+	AttrNumber attkeys[INDEX_MAX_KEYS];
+} BM25ScanInfo;
+
+/*
+ * Find the BM25 IndexScan in the plan tree and extract scan info.
+ */
+static bool
+find_bm25_scan_info(Plan *plan, BM25OidCache *oids, BM25ScanInfo *out)
+{
+	ListCell *lc;
+
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, IndexScan))
+	{
+		IndexScan *iscan = (IndexScan *)plan;
+		HeapTuple  ct;
+
+		ct = SearchSysCache1(RELOID, ObjectIdGetDatum(iscan->indexid));
+		if (HeapTupleIsValid(ct))
+		{
+			Oid amoid = ((Form_pg_class)GETSTRUCT(ct))->relam;
+			ReleaseSysCache(ct);
+
+			if (amoid == oids->bm25_am_oid)
+			{
+				HeapTuple idxt;
+
+				idxt = SearchSysCache1(
+						INDEXRELID, ObjectIdGetDatum(iscan->indexid));
+				if (HeapTupleIsValid(idxt))
+				{
+					Form_pg_index idx = (Form_pg_index)GETSTRUCT(idxt);
+					int			  i;
+
+					out->index_oid	= iscan->indexid;
+					out->scan_relid = iscan->scan.scanrelid;
+					out->nkeys		= idx->indnatts;
+					for (i = 0; i < idx->indnatts && i < INDEX_MAX_KEYS; i++)
+						out->attkeys[i] = idx->indkey.values[i];
+
+					ReleaseSysCache(idxt);
+
+					/* Extract bm25query Const from ORDER BY */
+					out->query_const = NULL;
+					foreach (lc, iscan->indexorderby)
+					{
+						Node *n = (Node *)lfirst(lc);
+						if (IsA(n, OpExpr))
+						{
+							OpExpr *op = (OpExpr *)n;
+							if (list_length(op->args) == 2)
+							{
+								Node *rhs = lsecond(op->args);
+								if (IsA(rhs, Const) &&
+									((Const *)rhs)->consttype ==
+											oids->tpquery_type_oid)
+								{
+									out->query_const = (Const *)rhs;
+									break;
+								}
+							}
+						}
+					}
+					return true;
+				}
+			}
+		}
+	}
+
+	if (find_bm25_scan_info(plan->lefttree, oids, out))
+		return true;
+	if (find_bm25_scan_info(plan->righttree, oids, out))
+		return true;
+
+	switch (nodeTag(plan))
+	{
+	case T_Append:
+		foreach (lc, ((Append *)plan)->appendplans)
+			if (find_bm25_scan_info((Plan *)lfirst(lc), oids, out))
+				return true;
+		break;
+	case T_MergeAppend:
+		foreach (lc, ((MergeAppend *)plan)->mergeplans)
+			if (find_bm25_scan_info((Plan *)lfirst(lc), oids, out))
+				return true;
+		break;
+	case T_SubqueryScan:
+		if (find_bm25_scan_info(((SubqueryScan *)plan)->subplan, oids, out))
+			return true;
+		break;
+	default:
+		break;
+	}
+	return false;
+}
+
+/*
+ * Rewrite bm25_highlights() zero-arg calls in a target list.
+ * Replaces them with bm25_highlights(query, index_name, col1, col2, ...).
+ */
+static void
+rewrite_highlights_in_targetlist(
+		List *targetlist, BM25OidCache *oids, BM25ScanInfo *info)
+{
+	ListCell *lc;
+	Oid		  auto_funcoid;
+	Oid		  full_funcoid;
+	char	 *index_name;
+	int		  i;
+
+	auto_funcoid = LookupFuncName(
+			list_make1(makeString("bm25_highlights")), 0, NULL, true);
+	if (!OidIsValid(auto_funcoid))
+		return;
+
+	{
+		Oid argtypes[3] = {oids->tpquery_type_oid, TEXTOID, TEXTARRAYOID};
+		full_funcoid	= LookupFuncName(
+				   list_make1(makeString("bm25_highlights")), 3, argtypes, true);
+	}
+	if (!OidIsValid(full_funcoid))
+		return;
+
+	index_name = get_rel_name(info->index_oid);
+	if (index_name == NULL)
+		return;
+
+	foreach (lc, targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *)lfirst(lc);
+		FuncExpr	*fe;
+		FuncExpr	*newfe;
+		List		*args;
+		Const		*name_const;
+
+		if (!IsA(tle->expr, FuncExpr))
+			continue;
+		fe = (FuncExpr *)tle->expr;
+		if (fe->funcid != auto_funcoid)
+			continue;
+
+		/* Build args: query, index_name, col1, col2, ... */
+		args = NIL;
+
+		/* arg0: bm25query (copy the Const from ORDER BY) */
+		if (info->query_const == NULL)
+			continue;
+		args = lappend(args, copyObject(info->query_const));
+
+		/* arg1: index name */
+		name_const = makeConst(
+				TEXTOID,
+				-1,
+				DEFAULT_COLLATION_OID,
+				-1,
+				PointerGetDatum(cstring_to_text(index_name)),
+				false,
+				false);
+		args = lappend(args, name_const);
+
+		/* arg2: VARIADIC array of indexed columns */
+		{
+			ArrayExpr *arr	 = makeNode(ArrayExpr);
+			List	  *elems = NIL;
+
+			for (i = 0; i < info->nkeys; i++)
+			{
+				Var *v =
+						makeVar(info->scan_relid,
+								info->attkeys[i],
+								TEXTOID,
+								-1,
+								DEFAULT_COLLATION_OID,
+								0);
+				elems = lappend(elems, v);
+			}
+			arr->array_typeid	= TEXTARRAYOID;
+			arr->array_collid	= DEFAULT_COLLATION_OID;
+			arr->element_typeid = TEXTOID;
+			arr->elements		= elems;
+			arr->multidims		= false;
+			arr->location		= -1;
+			args				= lappend(args, arr);
+		}
+
+		/* Build replacement FuncExpr */
+		newfe				  = makeNode(FuncExpr);
+		newfe->funcid		  = full_funcoid;
+		newfe->funcresulttype = JSONBOID;
+		newfe->funcretset	  = false;
+		newfe->funcvariadic	  = false;
+		newfe->funcformat	  = COERCE_EXPLICIT_CALL;
+		newfe->funccollid	  = InvalidOid;
+		newfe->inputcollid	  = DEFAULT_COLLATION_OID;
+		newfe->args			  = args;
+		newfe->location		  = fe->location;
+
+		tle->expr = (Expr *)newfe;
+	}
+}
+
+/*
+ * Find the column attnum for a field name in a BM25 index.
+ * Returns 0 if not found.
+ */
+static AttrNumber
+find_field_attnum(BM25ScanInfo *info, Oid heap_relid, const char *field_name)
+{
+	int i;
+
+	for (i = 0; i < info->nkeys; i++)
+	{
+		char *attname = get_attname(heap_relid, info->attkeys[i], true);
+		if (attname && strcmp(attname, field_name) == 0)
+		{
+			pfree(attname);
+			return info->attkeys[i];
+		}
+		if (attname)
+			pfree(attname);
+	}
+	return 0;
+}
+
+/*
+ * Rewrite bm25_snippet() / bm25_snippet_positions() zero-arg and
+ * field-name variants in a target list.
+ */
+static void
+rewrite_snippets_in_targetlist(
+		List *targetlist, BM25OidCache *oids, BM25ScanInfo *info)
+{
+	ListCell *lc;
+	Oid		  snippet_auto_oid;
+	Oid		  snippet_field_oid;
+	Oid		  positions_auto_oid;
+	Oid		  positions_field_oid;
+	Oid		  snippet_full_oid;
+	Oid		  positions_full_oid;
+	char	 *index_name;
+	Oid		  heap_relid;
+
+	{
+		Oid text_arg[1]	 = {TEXTOID};
+		snippet_auto_oid = LookupFuncName(
+				list_make1(makeString("bm25_snippet")), 0, NULL, true);
+		snippet_field_oid = LookupFuncName(
+				list_make1(makeString("bm25_snippet")), 1, text_arg, true);
+		positions_auto_oid = LookupFuncName(
+				list_make1(makeString("bm25_snippet_positions")),
+				0,
+				NULL,
+				true);
+		positions_field_oid = LookupFuncName(
+				list_make1(makeString("bm25_snippet_positions")),
+				1,
+				text_arg,
+				true);
+	}
+
+	{
+		Oid s_args[9] =
+				{TEXTOID,
+				 oids->tpquery_type_oid,
+				 TEXTOID,
+				 TEXTOID,
+				 TEXTOID,
+				 INT4OID,
+				 INT4OID,
+				 INT4OID,
+				 TEXTOID};
+		Oid p_args[6] =
+				{TEXTOID,
+				 oids->tpquery_type_oid,
+				 TEXTOID,
+				 INT4OID,
+				 INT4OID,
+				 TEXTOID};
+		snippet_full_oid = LookupFuncName(
+				list_make1(makeString("bm25_snippet")), 9, s_args, true);
+		positions_full_oid = LookupFuncName(
+				list_make1(makeString("bm25_snippet_positions")),
+				6,
+				p_args,
+				true);
+	}
+
+	if (!OidIsValid(snippet_auto_oid) && !OidIsValid(snippet_field_oid) &&
+		!OidIsValid(positions_auto_oid) && !OidIsValid(positions_field_oid))
+		return;
+
+	index_name = get_rel_name(info->index_oid);
+	if (index_name == NULL)
+		return;
+
+	{
+		HeapTuple idx_ht =
+				SearchSysCache1(INDEXRELID, ObjectIdGetDatum(info->index_oid));
+		if (!HeapTupleIsValid(idx_ht))
+			return;
+		heap_relid = ((Form_pg_index)GETSTRUCT(idx_ht))->indrelid;
+		ReleaseSysCache(idx_ht);
+	}
+
+	foreach (lc, targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *)lfirst(lc);
+		FuncExpr	*fe;
+		Oid			 fe_oid;
+		bool		 is_snippet;
+		bool		 is_field_variant;
+		AttrNumber	 col_attnum;
+		Const		*name_const;
+		FuncExpr	*newfe;
+		List		*args;
+
+		if (!IsA(tle->expr, FuncExpr))
+			continue;
+		fe	   = (FuncExpr *)tle->expr;
+		fe_oid = fe->funcid;
+
+		is_snippet		 = false;
+		is_field_variant = false;
+
+		if (fe_oid == snippet_auto_oid || fe_oid == positions_auto_oid)
+			is_snippet = true;
+		else if (fe_oid == snippet_field_oid || fe_oid == positions_field_oid)
+		{
+			is_snippet		 = true;
+			is_field_variant = true;
+		}
+
+		if (!is_snippet)
+			continue;
+		if (info->query_const == NULL)
+			continue;
+
+		if (is_field_variant)
+		{
+			Node *arg0 = linitial(fe->args);
+			if (IsA(arg0, Const) && !((Const *)arg0)->constisnull)
+			{
+				char *fname = TextDatumGetCString(((Const *)arg0)->constvalue);
+				col_attnum	= find_field_attnum(info, heap_relid, fname);
+				pfree(fname);
+				if (col_attnum == 0)
+					continue;
+			}
+			else
+				continue;
+		}
+		else
+		{
+			if (info->nkeys != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("%s without arguments requires a "
+								"single-column index",
+								(fe_oid == snippet_auto_oid)
+										? "bm25_snippet()"
+										: "bm25_snippet_positions()"),
+						 errhint("Use bm25_snippet('field_name') for "
+								 "multi-column indexes, or "
+								 "bm25_highlights() for all fields.")));
+			col_attnum = info->attkeys[0];
+		}
+
+		args = NIL;
+		/* arg0: document column */
+		args =
+				lappend(args,
+						makeVar(info->scan_relid,
+								col_attnum,
+								TEXTOID,
+								-1,
+								DEFAULT_COLLATION_OID,
+								0));
+		/* arg1: bm25query */
+		args = lappend(args, copyObject(info->query_const));
+		/* arg2: index name */
+		name_const = makeConst(
+				TEXTOID,
+				-1,
+				DEFAULT_COLLATION_OID,
+				-1,
+				PointerGetDatum(cstring_to_text(index_name)),
+				false,
+				false);
+		args = lappend(args, name_const);
+
+		if (fe_oid == snippet_auto_oid || fe_oid == snippet_field_oid)
+		{
+			/* defaults: start_tag, end_tag, max_num_chars, limit,
+			 * offset, field_name */
+			args =
+					lappend(args,
+							makeConst(
+									TEXTOID,
+									-1,
+									DEFAULT_COLLATION_OID,
+									-1,
+									PointerGetDatum(cstring_to_text("<b>")),
+									false,
+									false));
+			args =
+					lappend(args,
+							makeConst(
+									TEXTOID,
+									-1,
+									DEFAULT_COLLATION_OID,
+									-1,
+									PointerGetDatum(cstring_to_text("</b>")),
+									false,
+									false));
+			args =
+					lappend(args,
+							makeConst(
+									INT4OID,
+									-1,
+									InvalidOid,
+									4,
+									Int32GetDatum(150),
+									false,
+									true));
+			/* limit = NULL */
+			args = lappend(
+					args,
+					makeConst(
+							INT4OID, -1, InvalidOid, 4, (Datum)0, true, true));
+			/* offset = 0 */
+			args =
+					lappend(args,
+							makeConst(
+									INT4OID,
+									-1,
+									InvalidOid,
+									4,
+									Int32GetDatum(0),
+									false,
+									true));
+			/* field_name = NULL */
+			args =
+					lappend(args,
+							makeConst(
+									TEXTOID,
+									-1,
+									DEFAULT_COLLATION_OID,
+									-1,
+									(Datum)0,
+									true,
+									false));
+
+			newfe				  = makeNode(FuncExpr);
+			newfe->funcid		  = snippet_full_oid;
+			newfe->funcresulttype = TEXTOID;
+		}
+		else
+		{
+			/* limit = NULL */
+			args = lappend(
+					args,
+					makeConst(
+							INT4OID, -1, InvalidOid, 4, (Datum)0, true, true));
+			/* offset = 0 */
+			args =
+					lappend(args,
+							makeConst(
+									INT4OID,
+									-1,
+									InvalidOid,
+									4,
+									Int32GetDatum(0),
+									false,
+									true));
+			/* field_name = NULL */
+			args =
+					lappend(args,
+							makeConst(
+									TEXTOID,
+									-1,
+									DEFAULT_COLLATION_OID,
+									-1,
+									(Datum)0,
+									true,
+									false));
+
+			newfe				  = makeNode(FuncExpr);
+			newfe->funcid		  = positions_full_oid;
+			newfe->funcresulttype = get_func_rettype(positions_full_oid);
+		}
+
+		newfe->funcretset	= false;
+		newfe->funcvariadic = false;
+		newfe->funcformat	= COERCE_EXPLICIT_CALL;
+		newfe->funccollid	= InvalidOid;
+		newfe->inputcollid	= DEFAULT_COLLATION_OID;
+		newfe->args			= args;
+		newfe->location		= fe->location;
+
+		tle->expr = (Expr *)newfe;
+	}
+}
+
+/*
+ * Recursively walk the plan tree and rewrite highlight/snippet calls.
+ */
+static void
+rewrite_highlights_in_plan(Plan *plan, BM25OidCache *oids, BM25ScanInfo *info)
+{
+	ListCell *lc;
+
+	if (plan == NULL)
+		return;
+
+	rewrite_highlights_in_targetlist(plan->targetlist, oids, info);
+	rewrite_snippets_in_targetlist(plan->targetlist, oids, info);
+
+	rewrite_highlights_in_plan(plan->lefttree, oids, info);
+	rewrite_highlights_in_plan(plan->righttree, oids, info);
+
+	switch (nodeTag(plan))
+	{
+	case T_Append:
+		foreach (lc, ((Append *)plan)->appendplans)
+			rewrite_highlights_in_plan((Plan *)lfirst(lc), oids, info);
+		break;
+	case T_MergeAppend:
+		foreach (lc, ((MergeAppend *)plan)->mergeplans)
+			rewrite_highlights_in_plan((Plan *)lfirst(lc), oids, info);
+		break;
+	case T_SubqueryScan:
+		rewrite_highlights_in_plan(
+				((SubqueryScan *)plan)->subplan, oids, info);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
  * Recursively walk the plan tree and replace BM25 score expressions.
  */
 static void
@@ -2211,6 +2762,14 @@ tp_planner_hook(
 		validate_explicit_index_usage(result->planTree, &oid_cache);
 
 		replace_scores_in_plan(result->planTree, &oid_cache);
+
+		{
+			BM25ScanInfo scan_info;
+
+			if (find_bm25_scan_info(result->planTree, &oid_cache, &scan_info))
+				rewrite_highlights_in_plan(
+						result->planTree, &oid_cache, &scan_info);
+		}
 	}
 
 	return result;

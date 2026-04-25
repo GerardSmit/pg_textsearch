@@ -91,6 +91,11 @@ PG_FUNCTION_INFO_V1(bm25_snippet_text);
 PG_FUNCTION_INFO_V1(bm25_snippet_positions);
 PG_FUNCTION_INFO_V1(bm25_snippet_positions_text);
 PG_FUNCTION_INFO_V1(bm25_highlights);
+PG_FUNCTION_INFO_V1(bm25_highlights_auto);
+PG_FUNCTION_INFO_V1(bm25_snippet_auto);
+PG_FUNCTION_INFO_V1(bm25_snippet_field);
+PG_FUNCTION_INFO_V1(bm25_snippet_positions_auto);
+PG_FUNCTION_INFO_V1(bm25_snippet_positions_field);
 
 static const char *
 tp_hl_match_type_name(TpHighlightMatchType type)
@@ -1294,4 +1299,61 @@ bm25_highlights(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
+}
+
+/*
+ * Zero-arg stub: the planner rewrites bm25_highlights() to inject
+ * the query, index name, and column values from the active BM25 scan.
+ * If the planner didn't rewrite (no active scan), error out.
+ */
+Datum
+bm25_highlights_auto(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("bm25_highlights() requires an active bm25 "
+					"index scan"),
+			 errhint("Use ORDER BY ... <@> to_bm25query(...) to "
+					 "enable an index scan, or pass arguments "
+					 "explicitly.")));
+	PG_RETURN_NULL();
+}
+
+static inline void
+raise_no_scan_error(const char *func)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s requires an active bm25 index scan", func),
+			 errhint("Use ORDER BY ... <@> to_bm25query(...) to "
+					 "enable an index scan, or pass arguments "
+					 "explicitly.")));
+}
+
+Datum
+bm25_snippet_auto(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	raise_no_scan_error("bm25_snippet()");
+	PG_RETURN_NULL();
+}
+
+Datum
+bm25_snippet_field(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	raise_no_scan_error("bm25_snippet(field_name)");
+	PG_RETURN_NULL();
+}
+
+Datum
+bm25_snippet_positions_auto(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	raise_no_scan_error("bm25_snippet_positions()");
+	PG_RETURN_NULL();
+}
+
+Datum
+bm25_snippet_positions_field(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	raise_no_scan_error("bm25_snippet_positions(field_name)");
+	PG_RETURN_NULL();
 }

@@ -103,6 +103,24 @@ SELECT bm25_highlights(
   VARIADIC ARRAY[title, body])
 FROM highlight_docs WHERE id = 3;
 
+-- Zero-arg bm25_highlights(): query, index, columns inferred from scan.
+SELECT bm25_highlights()
+FROM highlight_docs
+ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
+LIMIT 2;
+
+-- bm25_snippet('field_name'): multi-col, field resolves to column.
+SELECT bm25_snippet('title')
+FROM highlight_docs
+ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
+LIMIT 2;
+
+-- bm25_snippet_positions('field_name')
+SELECT bm25_snippet_positions('title')
+FROM highlight_docs
+ORDER BY (title, body) <@> to_bm25query('hello', 'highlight_docs_idx')
+LIMIT 2;
+
 DROP TABLE highlight_docs;
 DROP EXTENSION pg_textsearch CASCADE;
 
