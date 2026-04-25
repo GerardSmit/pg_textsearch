@@ -663,11 +663,11 @@ tp_hl_collect(
 			uint8 fmt	  = tp_metapage_field_format(metap, fmt_idx);
 			if (fmt != TP_FORMAT_PLAIN)
 			{
-				TpOffsetMap *omap = NULL;
-				text		*normalized =
-						tp_normalize_markup_with_map(
-								document, (TpContentFormat)fmt,
-								offset_map_out ? &omap : NULL);
+				TpOffsetMap *omap		= NULL;
+				text		*normalized = tp_normalize_markup_with_map(
+						   document,
+						   (TpContentFormat)fmt,
+						   offset_map_out ? &omap : NULL);
 				doc		= text_to_cstring(normalized);
 				doc_len = VARSIZE_ANY_EXHDR(normalized);
 				if (normalized_out)
@@ -941,8 +941,13 @@ bm25_snippet(PG_FUNCTION_ARGS)
 	{
 		text *hl_doc = document;
 		tp_hl_collect(
-				document, query, index_name, field_name,
-				&ranges, &hl_doc, NULL);
+				document,
+				query,
+				index_name,
+				field_name,
+				&ranges,
+				&hl_doc,
+				NULL);
 		PG_RETURN_TEXT_P(tp_hl_render_snippet(
 				hl_doc,
 				&ranges,
@@ -995,8 +1000,13 @@ bm25_snippet_text(PG_FUNCTION_ARGS)
 	{
 		text *hl_doc = document;
 		tp_hl_collect(
-				document, query, index_name, field_name,
-				&ranges, &hl_doc, NULL);
+				document,
+				query,
+				index_name,
+				field_name,
+				&ranges,
+				&hl_doc,
+				NULL);
 		PG_RETURN_TEXT_P(tp_hl_render_snippet(
 				hl_doc,
 				&ranges,
@@ -1036,20 +1046,18 @@ bm25_snippet_positions(PG_FUNCTION_ARGS)
 
 	{
 		TpOffsetMap *omap = NULL;
-		tp_hl_collect(document, query, index_name, field_name,
-					  &ranges, NULL, &omap);
+		tp_hl_collect(
+				document, query, index_name, field_name, &ranges, NULL, &omap);
 		if (omap)
 		{
 			for (int i = 0; i < ranges.count; i++)
 			{
 				ranges.items[i].start =
 						tp_hl_map_start(omap, ranges.items[i].start);
-				ranges.items[i].end =
-						tp_hl_map_end(omap, ranges.items[i].end);
+				ranges.items[i].end = tp_hl_map_end(omap, ranges.items[i].end);
 			}
 		}
-		PG_RETURN_ARRAYTYPE_P(
-				tp_hl_ranges_to_array(&ranges, limit, offset));
+		PG_RETURN_ARRAYTYPE_P(tp_hl_ranges_to_array(&ranges, limit, offset));
 	}
 }
 
@@ -1083,20 +1091,18 @@ bm25_snippet_positions_text(PG_FUNCTION_ARGS)
 	query = create_tpquery_from_name(query_cstr, index_name);
 	{
 		TpOffsetMap *omap = NULL;
-		tp_hl_collect(document, query, index_name, field_name,
-					  &ranges, NULL, &omap);
+		tp_hl_collect(
+				document, query, index_name, field_name, &ranges, NULL, &omap);
 		if (omap)
 		{
 			for (int i = 0; i < ranges.count; i++)
 			{
 				ranges.items[i].start =
 						tp_hl_map_start(omap, ranges.items[i].start);
-				ranges.items[i].end =
-						tp_hl_map_end(omap, ranges.items[i].end);
+				ranges.items[i].end = tp_hl_map_end(omap, ranges.items[i].end);
 			}
 		}
-		PG_RETURN_ARRAYTYPE_P(
-				tp_hl_ranges_to_array(&ranges, limit, offset));
+		PG_RETURN_ARRAYTYPE_P(tp_hl_ranges_to_array(&ranges, limit, offset));
 	}
 }
 
@@ -1158,8 +1164,13 @@ tp_hl_append_json_field(
 	{
 		text *hl_doc = field_text;
 		tp_hl_collect(
-				field_text, query, index_name, field_name,
-				&ranges, &hl_doc, &omap);
+				field_text,
+				query,
+				index_name,
+				field_name,
+				&ranges,
+				&hl_doc,
+				&omap);
 		snippet = tp_hl_render_snippet(
 				hl_doc, &ranges, "<b>", "</b>", 150, -1, 0);
 	}
@@ -1180,15 +1191,12 @@ tp_hl_append_json_field(
 	for (i = 0; i < ranges.count; i++)
 	{
 		TpHighlightRange *range = &ranges.items[i];
-		int start = tp_hl_map_start(omap, range->start);
-		int end	  = tp_hl_map_end(omap, range->end);
+		int				  start = tp_hl_map_start(omap, range->start);
+		int				  end	= tp_hl_map_end(omap, range->end);
 		if (i > 0)
 			appendStringInfoChar(out, ',');
 		appendStringInfo(
-				out,
-				"{\"start\":%d,\"end\":%d,\"term\":",
-				start,
-				end);
+				out, "{\"start\":%d,\"end\":%d,\"term\":", start, end);
 		tp_hl_json_escape(out, range->term);
 		appendStringInfoString(out, ",\"matched_text\":");
 		tp_hl_json_escape(out, range->matched_text);

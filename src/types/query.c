@@ -195,6 +195,8 @@ PG_FUNCTION_INFO_V1(tpquery_out);
 PG_FUNCTION_INFO_V1(tpquery_recv);
 PG_FUNCTION_INFO_V1(tpquery_send);
 PG_FUNCTION_INFO_V1(to_tpquery_unified);
+PG_FUNCTION_INFO_V1(to_tpquery_text);
+PG_FUNCTION_INFO_V1(to_tpquery_text_index);
 PG_FUNCTION_INFO_V1(bm25_text_bm25query_score);
 PG_FUNCTION_INFO_V1(bm25_text_text_score);
 PG_FUNCTION_INFO_V1(bm25_textarray_bm25query_score);
@@ -465,6 +467,19 @@ to_tpquery_unified(PG_FUNCTION_ARGS)
 		pfree(index_name);
 
 	PG_RETURN_POINTER(result);
+}
+
+/* Backward-compat shims for old SQL versions (≤ 1.1.0). */
+Datum
+to_tpquery_text(PG_FUNCTION_ARGS)
+{
+	return to_tpquery_unified(fcinfo);
+}
+
+Datum
+to_tpquery_text_index(PG_FUNCTION_ARGS)
+{
+	return to_tpquery_unified(fcinfo);
 }
 
 /*

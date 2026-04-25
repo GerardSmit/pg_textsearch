@@ -263,16 +263,18 @@ CREATE FUNCTION @extschema@.bm25_dump_index(text) RETURNS text
 CREATE FUNCTION @extschema@.bm25_prefix(prefix_text text)
 RETURNS @extschema@.bm25query
 AS $fn$
-    SELECT @extschema@.to_bm25query(prefix_text || '*', grammar => true)
+    SELECT @extschema@.to_bm25query(prefix_text OPERATOR(pg_catalog.||) '*', grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = @extschema@, pg_catalog;
 
 CREATE FUNCTION @extschema@.bm25_prefix(prefix_text text, index_name text)
 RETURNS @extschema@.bm25query
 AS $fn$
-    SELECT @extschema@.to_bm25query(prefix_text || '*', index_name, grammar => true)
+    SELECT @extschema@.to_bm25query(prefix_text OPERATOR(pg_catalog.||) '*', index_name, grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = @extschema@, pg_catalog;
 
 -- Phrase builder: bm25_phrase(ARRAY['foo','bar']) → '"foo bar"'.
 -- Tokens are joined with single spaces; whitespace inside individual
@@ -281,21 +283,27 @@ CREATE FUNCTION @extschema@.bm25_phrase(tokens text[])
 RETURNS @extschema@.bm25query
 AS $fn$
     SELECT CASE
-        WHEN array_length(tokens, 1) IS NULL OR array_length(tokens, 1) = 0
+        WHEN pg_catalog.array_length(tokens, 1) IS NULL
+             OR pg_catalog.array_length(tokens, 1) OPERATOR(pg_catalog.=) 0
             THEN @extschema@.to_bm25query('""', grammar => true)
-        ELSE @extschema@.to_bm25query('"' || array_to_string(tokens, ' ') || '"', grammar => true)
+        ELSE @extschema@.to_bm25query(
+            '"' OPERATOR(pg_catalog.||) pg_catalog.array_to_string(tokens, ' ')
+                OPERATOR(pg_catalog.||) '"', grammar => true)
     END
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = @extschema@, pg_catalog;
 
 CREATE FUNCTION @extschema@.bm25_phrase(tokens text[], index_name text)
 RETURNS @extschema@.bm25query
 AS $fn$
     SELECT @extschema@.to_bm25query(
-        '"' || array_to_string(tokens, ' ') || '"',
+        '"' OPERATOR(pg_catalog.||) pg_catalog.array_to_string(tokens, ' ')
+            OPERATOR(pg_catalog.||) '"',
         index_name, grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = @extschema@, pg_catalog;
 
 -- Phrase-prefix builder: bm25_phrase_prefix(ARRAY['foo','bar']) →
 -- '"foo bar*"'. The final token gets the trailing '*' marker.
@@ -303,22 +311,38 @@ CREATE FUNCTION @extschema@.bm25_phrase_prefix(tokens text[])
 RETURNS @extschema@.bm25query
 AS $fn$
     SELECT @extschema@.to_bm25query(
-        '"' || array_to_string(tokens[1:array_length(tokens,1)-1], ' ') ||
-        CASE WHEN array_length(tokens, 1) > 1 THEN ' ' ELSE '' END ||
-        tokens[array_length(tokens, 1)] || '*"', grammar => true)
+        '"' OPERATOR(pg_catalog.||)
+        pg_catalog.array_to_string(
+            tokens[1:pg_catalog.array_length(tokens,1) OPERATOR(pg_catalog.-) 1],
+            ' ')
+        OPERATOR(pg_catalog.||)
+        CASE WHEN pg_catalog.array_length(tokens, 1) OPERATOR(pg_catalog.>) 1
+            THEN ' ' ELSE '' END
+        OPERATOR(pg_catalog.||)
+        tokens[pg_catalog.array_length(tokens, 1)]
+        OPERATOR(pg_catalog.||) '*"', grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = @extschema@, pg_catalog;
 
 CREATE FUNCTION @extschema@.bm25_phrase_prefix(tokens text[], index_name text)
 RETURNS @extschema@.bm25query
 AS $fn$
     SELECT @extschema@.to_bm25query(
-        '"' || array_to_string(tokens[1:array_length(tokens,1)-1], ' ') ||
-        CASE WHEN array_length(tokens, 1) > 1 THEN ' ' ELSE '' END ||
-        tokens[array_length(tokens, 1)] || '*"',
+        '"' OPERATOR(pg_catalog.||)
+        pg_catalog.array_to_string(
+            tokens[1:pg_catalog.array_length(tokens,1) OPERATOR(pg_catalog.-) 1],
+            ' ')
+        OPERATOR(pg_catalog.||)
+        CASE WHEN pg_catalog.array_length(tokens, 1) OPERATOR(pg_catalog.>) 1
+            THEN ' ' ELSE '' END
+        OPERATOR(pg_catalog.||)
+        tokens[pg_catalog.array_length(tokens, 1)]
+        OPERATOR(pg_catalog.||) '*"',
         index_name, grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = @extschema@, pg_catalog;
 
 -- Highlighting helpers. Positions are byte offsets represented as
 -- half-open int4range values: [start_byte, end_byte).

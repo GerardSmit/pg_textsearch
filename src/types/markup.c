@@ -100,19 +100,16 @@ tp_html_map_ensure(TpHtmlMapState *st)
 		return;
 	if (st->out->len >= st->map_alloc)
 	{
-		st->map_alloc = Max(st->map_alloc * 2, 256);
-		st->offset_map =
-				repalloc(st->offset_map, sizeof(int) * st->map_alloc);
-		st->end_map =
-				repalloc(st->end_map, sizeof(int) * st->map_alloc);
+		st->map_alloc  = Max(st->map_alloc * 2, 256);
+		st->offset_map = repalloc(st->offset_map, sizeof(int) * st->map_alloc);
+		st->end_map	   = repalloc(st->end_map, sizeof(int) * st->map_alloc);
 	}
 }
 
 static void
 tp_html_skip_tags(TpHtmlMapState *st)
 {
-	while (st->orig_cursor < st->orig_len &&
-		   st->orig[st->orig_cursor] == '<')
+	while (st->orig_cursor < st->orig_len && st->orig[st->orig_cursor] == '<')
 	{
 		while (st->orig_cursor < st->orig_len &&
 			   st->orig[st->orig_cursor] != '>')
@@ -125,8 +122,8 @@ tp_html_skip_tags(TpHtmlMapState *st)
 static void
 tp_html_skip_element_orig(TpHtmlMapState *st, const xmlChar *name)
 {
-	char	close_tag[64];
-	int		close_len;
+	char close_tag[64];
+	int	 close_len;
 
 	close_len = snprintf(close_tag, sizeof(close_tag), "</%s>", name);
 	if (close_len >= (int)sizeof(close_tag))
@@ -134,8 +131,8 @@ tp_html_skip_element_orig(TpHtmlMapState *st, const xmlChar *name)
 
 	while (st->orig_cursor < st->orig_len)
 	{
-		if (pg_strncasecmp(st->orig + st->orig_cursor,
-						   close_tag, close_len) == 0)
+		if (pg_strncasecmp(st->orig + st->orig_cursor, close_tag, close_len) ==
+			0)
 		{
 			st->orig_cursor += close_len;
 			return;
@@ -151,7 +148,7 @@ tp_html_walk_mapped(xmlNode *node, TpHtmlMapState *st)
 	{
 		if (node->type == XML_TEXT_NODE && node->content != NULL)
 		{
-			const char *text = (const char *)node->content;
+			const char *text	 = (const char *)node->content;
 			int			text_len = strlen(text);
 
 			if (st->out->len > 0)
@@ -160,7 +157,7 @@ tp_html_walk_mapped(xmlNode *node, TpHtmlMapState *st)
 				if (st->offset_map)
 				{
 					st->offset_map[st->out->len] = st->orig_cursor;
-					st->end_map[st->out->len]	  = st->orig_cursor;
+					st->end_map[st->out->len]	 = st->orig_cursor;
 				}
 				appendStringInfoChar(st->out, ' ');
 			}
@@ -188,7 +185,7 @@ tp_html_walk_mapped(xmlNode *node, TpHtmlMapState *st)
 				if (st->offset_map)
 				{
 					st->offset_map[st->out->len] = char_start;
-					st->end_map[st->out->len]	  = st->orig_cursor;
+					st->end_map[st->out->len]	 = st->orig_cursor;
 				}
 				appendStringInfoChar(st->out, text[i]);
 			}
@@ -228,14 +225,12 @@ tp_md_map_byte(TpMdState *st, int orig_start, int orig_end)
 		return;
 	if (st->out->len >= st->map_alloc)
 	{
-		st->map_alloc = Max(st->map_alloc * 2, 256);
-		st->offset_map =
-				repalloc(st->offset_map, sizeof(int) * st->map_alloc);
-		st->end_map =
-				repalloc(st->end_map, sizeof(int) * st->map_alloc);
+		st->map_alloc  = Max(st->map_alloc * 2, 256);
+		st->offset_map = repalloc(st->offset_map, sizeof(int) * st->map_alloc);
+		st->end_map	   = repalloc(st->end_map, sizeof(int) * st->map_alloc);
 	}
 	st->offset_map[st->out->len] = orig_start;
-	st->end_map[st->out->len]	  = orig_end;
+	st->end_map[st->out->len]	 = orig_end;
 }
 
 static int
@@ -313,8 +308,7 @@ tp_md_text(MD_TEXTTYPE type, const MD_CHAR *txt, MD_SIZE size, void *userdata)
 		}
 		for (MD_SIZE i = 0; i < size; i++)
 		{
-			tp_md_map_byte(st, orig_off + (int)i,
-						   orig_off + (int)i + 1);
+			tp_md_map_byte(st, orig_off + (int)i, orig_off + (int)i + 1);
 			appendStringInfoChar(st->out, txt[i]);
 		}
 		break;
@@ -377,8 +371,8 @@ tp_md_text(MD_TEXTTYPE type, const MD_CHAR *txt, MD_SIZE size, void *userdata)
 }
 
 static text *
-tp_normalize_markdown_internal(const char *input, int input_len,
-							   TpOffsetMap **map_out)
+tp_normalize_markdown_internal(
+		const char *input, int input_len, TpOffsetMap **map_out)
 {
 	StringInfoData out;
 	TpMdState	   state;
@@ -386,11 +380,11 @@ tp_normalize_markdown_internal(const char *input, int input_len,
 	int			   ret;
 
 	initStringInfo(&out);
-	state.out		  = &out;
-	state.skip_depth  = 0;
-	state.input_base  = input;
-	state.offset_map  = NULL;
-	state.map_alloc	  = 0;
+	state.out		 = &out;
+	state.skip_depth = 0;
+	state.input_base = input;
+	state.offset_map = NULL;
+	state.map_alloc	 = 0;
 
 	if (map_out)
 	{
@@ -427,10 +421,10 @@ tp_normalize_markdown_internal(const char *input, int input_len,
 
 		if (norm_len >= state.map_alloc)
 		{
-			state.offset_map = repalloc(state.offset_map,
-										sizeof(int) * (norm_len + 1));
-			state.end_map = repalloc(state.end_map,
-									 sizeof(int) * (norm_len + 1));
+			state.offset_map =
+					repalloc(state.offset_map, sizeof(int) * (norm_len + 1));
+			state.end_map =
+					repalloc(state.end_map, sizeof(int) * (norm_len + 1));
 		}
 		state.offset_map[norm_len] = input_len;
 		state.end_map[norm_len]	   = input_len;
@@ -441,9 +435,9 @@ tp_normalize_markdown_internal(const char *input, int input_len,
 			if (state.offset_map[i] < 0)
 			{
 				state.offset_map[i] = (i + 1 < norm_len)
-										? state.offset_map[i + 1]
-										: input_len;
-				state.end_map[i] = state.offset_map[i];
+											? state.offset_map[i + 1]
+											: input_len;
+				state.end_map[i]	= state.offset_map[i];
 			}
 		}
 
@@ -497,12 +491,11 @@ tp_normalize_markup(text *input, TpContentFormat fmt)
 }
 
 text *
-tp_normalize_markup_with_map(text *input, TpContentFormat fmt,
-							 TpOffsetMap **map_out)
+tp_normalize_markup_with_map(
+		text *input, TpContentFormat fmt, TpOffsetMap **map_out)
 {
 	const char *raw;
 	int			len;
-	text	   *result;
 
 	if (map_out)
 		*map_out = NULL;
@@ -524,7 +517,10 @@ tp_normalize_markup_with_map(text *input, TpContentFormat fmt,
 			StringInfoData buf;
 
 			doc = htmlReadMemory(
-					raw, len, NULL, "UTF-8",
+					raw,
+					len,
+					NULL,
+					"UTF-8",
 					HTML_PARSE_RECOVER | HTML_PARSE_NOERROR |
 							HTML_PARSE_NOWARNING | HTML_PARSE_NONET);
 			if (doc == NULL)
@@ -549,10 +545,10 @@ tp_normalize_markup_with_map(text *input, TpContentFormat fmt,
 				int			 norm_len = buf.len;
 				if (norm_len >= st.map_alloc)
 				{
-					st.offset_map = repalloc(st.offset_map,
-											 sizeof(int) * (norm_len + 1));
-					st.end_map = repalloc(st.end_map,
-										  sizeof(int) * (norm_len + 1));
+					st.offset_map = repalloc(
+							st.offset_map, sizeof(int) * (norm_len + 1));
+					st.end_map =
+							repalloc(st.end_map, sizeof(int) * (norm_len + 1));
 				}
 				st.offset_map[norm_len] = st.orig_cursor;
 				st.end_map[norm_len]	= st.orig_cursor;

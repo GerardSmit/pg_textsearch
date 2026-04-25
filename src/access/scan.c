@@ -227,8 +227,7 @@ tp_parallelrescan(IndexScanDesc scan)
 				scan->parallel_scan->ps_offset_am);
 #else
 		TpParallelScan *pscan = (TpParallelScan *)OffsetToPointer(
-				(void *)scan->parallel_scan,
-				scan->parallel_scan->ps_offset);
+				(void *)scan->parallel_scan, scan->parallel_scan->ps_offset);
 #endif
 
 		pg_atomic_write_u32(&pscan->setup_done, 0);
@@ -372,12 +371,10 @@ tp_get_parallel_scan(IndexScanDesc scan)
 		return NULL;
 #if PG_VERSION_NUM >= 180000
 	return (TpParallelScan *)OffsetToPointer(
-			(void *)scan->parallel_scan,
-			scan->parallel_scan->ps_offset_am);
+			(void *)scan->parallel_scan, scan->parallel_scan->ps_offset_am);
 #else
 	return (TpParallelScan *)OffsetToPointer(
-			(void *)scan->parallel_scan,
-			scan->parallel_scan->ps_offset);
+			(void *)scan->parallel_scan, scan->parallel_scan->ps_offset);
 #endif
 }
 

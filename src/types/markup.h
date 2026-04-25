@@ -26,9 +26,8 @@ typedef struct TpOffsetMap
 } TpOffsetMap;
 
 extern text *tp_normalize_markup(text *input, TpContentFormat fmt);
-extern text *tp_normalize_markup_with_map(text *input,
-										  TpContentFormat fmt,
-										  TpOffsetMap **map_out);
+extern text *tp_normalize_markup_with_map(
+		text *input, TpContentFormat fmt, TpOffsetMap **map_out);
 
 extern TpContentFormat tp_parse_content_format(const char *str);
 extern const char	  *tp_content_format_name(TpContentFormat fmt);

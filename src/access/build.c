@@ -1950,6 +1950,7 @@ tp_insert(
 	int				   col;
 	int				   all_cap						= 0;
 	int32			   field_lengths[TP_MAX_FIELDS] = {0};
+	uint8			   field_formats_ins[TP_MAX_FIELDS];
 
 	(void)checkUnique;	  /* unused */
 	(void)indexUnchanged; /* unused */
@@ -1968,7 +1969,6 @@ tp_insert(
 	 * has ≥ 2 fields — independent of num_cols in indexInfo, which
 	 * should match in practice but we trust the metapage.
 	 */
-	uint8 field_formats_ins[TP_MAX_FIELDS];
 	memset(field_formats_ins, 0, sizeof(field_formats_ins));
 	{
 		TpIndexMetaPage metap = tp_get_metapage(index);
