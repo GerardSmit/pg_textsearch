@@ -18,7 +18,17 @@ typedef enum TpContentFormat
 
 #define TP_FORMAT_COUNT 3
 
+typedef struct TpOffsetMap
+{
+	int *offsets;	  /* offsets[i] = orig start of char i */
+	int *end_offsets; /* end_offsets[i] = orig pos after char i */
+	int	 len;		  /* length of normalized text */
+} TpOffsetMap;
+
 extern text *tp_normalize_markup(text *input, TpContentFormat fmt);
+extern text *tp_normalize_markup_with_map(text *input,
+										  TpContentFormat fmt,
+										  TpOffsetMap **map_out);
 
 extern TpContentFormat tp_parse_content_format(const char *str);
 extern const char	  *tp_content_format_name(TpContentFormat fmt);

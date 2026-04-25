@@ -703,24 +703,24 @@ FROM markup_md WHERE id = 4;
 -- ============================================================
 -- 18. Snippet positions on normalized content
 -- ============================================================
--- HTML: positions are against normalized (stripped) text
+-- HTML: positions are against original text
 SELECT bm25_snippet_positions(
   content,
   to_bm25query('friend', 'markup_html_idx'))
 FROM markup_html WHERE id = 1;
  bm25_snippet_positions 
 ------------------------
- {"[16,23)"}
+ {"[28,35)"}
 (1 row)
 
--- Markdown: positions against normalized text
+-- Markdown: positions against original text
 SELECT bm25_snippet_positions(
   content,
   to_bm25query('bold', 'markup_md_idx'))
 FROM markup_md WHERE id = 1;
  bm25_snippet_positions 
 ------------------------
- {"[18,22)"}
+ {"[21,25)"}
 (1 row)
 
 -- ============================================================
@@ -833,7 +833,7 @@ SELECT bm25_highlights(
 FROM markup_3c_hmp WHERE id = 1;
                                                                                                                                                       bm25_highlights                                                                                                                                                      
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- {"col_md": {"matches": [{"end": 22, "term": "emphasi", "start": 14, "match_type": "exact", "matched_text": "emphasis"}], "snippet": "Heading with  <b>emphasis</b>", "positions": [[14, 22]]}, "col_html": {"matches": [], "snippet": "", "positions": []}, "col_plain": {"matches": [], "snippet": "", "positions": []}}
+ {"col_md": {"matches": [{"end": 25, "term": "emphasi", "start": 17, "match_type": "exact", "matched_text": "emphasis"}], "snippet": "Heading with  <b>emphasis</b>", "positions": [[17, 25]]}, "col_html": {"matches": [], "snippet": "", "positions": []}, "col_plain": {"matches": [], "snippet": "", "positions": []}}
 (1 row)
 
 -- ============================================================

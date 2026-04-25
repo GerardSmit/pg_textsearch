@@ -605,7 +605,8 @@ tp_hl_collect(
 		const char		  *index_name,
 		const char		  *field_name,
 		TpHighlightRanges *ranges,
-		text			 **normalized_out)
+		text			 **normalized_out,
+		TpOffsetMap		 **offset_map_out)
 {
 	char			  *query_text = get_tpquery_text(query);
 	Relation		   index_rel  = NULL;
@@ -625,6 +626,8 @@ tp_hl_collect(
 
 	if (normalized_out)
 		*normalized_out = document;
+	if (offset_map_out)
+		*offset_map_out = NULL;
 
 	tp_hl_ranges_init(ranges);
 
@@ -660,12 +663,17 @@ tp_hl_collect(
 			uint8 fmt	  = tp_metapage_field_format(metap, fmt_idx);
 			if (fmt != TP_FORMAT_PLAIN)
 			{
-				text *normalized =
-						tp_normalize_markup(document, (TpContentFormat)fmt);
+				TpOffsetMap *omap = NULL;
+				text		*normalized =
+						tp_normalize_markup_with_map(
+								document, (TpContentFormat)fmt,
+								offset_map_out ? &omap : NULL);
 				doc		= text_to_cstring(normalized);
 				doc_len = VARSIZE_ANY_EXHDR(normalized);
 				if (normalized_out)
 					*normalized_out = normalized;
+				if (offset_map_out)
+					*offset_map_out = omap;
 			}
 			tokens = tp_hl_parse_doc_tokens(
 					doc, doc_len, text_config_oid, &token_count);
@@ -690,6 +698,28 @@ tp_hl_collect(
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+}
+
+static int
+tp_hl_map_start(TpOffsetMap *map, int norm_pos)
+{
+	if (!map || norm_pos < 0)
+		return norm_pos;
+	if (norm_pos >= map->len)
+		return map->offsets[map->len];
+	return map->offsets[norm_pos];
+}
+
+static int
+tp_hl_map_end(TpOffsetMap *map, int norm_pos)
+{
+	if (!map || norm_pos < 0)
+		return norm_pos;
+	if (norm_pos <= 0)
+		return map->end_offsets[0];
+	if (norm_pos > map->len)
+		return map->end_offsets[map->len];
+	return map->end_offsets[norm_pos - 1];
 }
 
 static int
@@ -911,7 +941,8 @@ bm25_snippet(PG_FUNCTION_ARGS)
 	{
 		text *hl_doc = document;
 		tp_hl_collect(
-				document, query, index_name, field_name, &ranges, &hl_doc);
+				document, query, index_name, field_name,
+				&ranges, &hl_doc, NULL);
 		PG_RETURN_TEXT_P(tp_hl_render_snippet(
 				hl_doc,
 				&ranges,
@@ -964,7 +995,8 @@ bm25_snippet_text(PG_FUNCTION_ARGS)
 	{
 		text *hl_doc = document;
 		tp_hl_collect(
-				document, query, index_name, field_name, &ranges, &hl_doc);
+				document, query, index_name, field_name,
+				&ranges, &hl_doc, NULL);
 		PG_RETURN_TEXT_P(tp_hl_render_snippet(
 				hl_doc,
 				&ranges,
@@ -1002,8 +1034,23 @@ bm25_snippet_positions(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("offset must be greater than or equal to zero")));
 
-	tp_hl_collect(document, query, index_name, field_name, &ranges, NULL);
-	PG_RETURN_ARRAYTYPE_P(tp_hl_ranges_to_array(&ranges, limit, offset));
+	{
+		TpOffsetMap *omap = NULL;
+		tp_hl_collect(document, query, index_name, field_name,
+					  &ranges, NULL, &omap);
+		if (omap)
+		{
+			for (int i = 0; i < ranges.count; i++)
+			{
+				ranges.items[i].start =
+						tp_hl_map_start(omap, ranges.items[i].start);
+				ranges.items[i].end =
+						tp_hl_map_end(omap, ranges.items[i].end);
+			}
+		}
+		PG_RETURN_ARRAYTYPE_P(
+				tp_hl_ranges_to_array(&ranges, limit, offset));
+	}
 }
 
 Datum
@@ -1034,8 +1081,23 @@ bm25_snippet_positions_text(PG_FUNCTION_ARGS)
 				 errmsg("offset must be greater than or equal to zero")));
 
 	query = create_tpquery_from_name(query_cstr, index_name);
-	tp_hl_collect(document, query, index_name, field_name, &ranges, NULL);
-	PG_RETURN_ARRAYTYPE_P(tp_hl_ranges_to_array(&ranges, limit, offset));
+	{
+		TpOffsetMap *omap = NULL;
+		tp_hl_collect(document, query, index_name, field_name,
+					  &ranges, NULL, &omap);
+		if (omap)
+		{
+			for (int i = 0; i < ranges.count; i++)
+			{
+				ranges.items[i].start =
+						tp_hl_map_start(omap, ranges.items[i].start);
+				ranges.items[i].end =
+						tp_hl_map_end(omap, ranges.items[i].end);
+			}
+		}
+		PG_RETURN_ARRAYTYPE_P(
+				tp_hl_ranges_to_array(&ranges, limit, offset));
+	}
 }
 
 static void
@@ -1089,13 +1151,15 @@ tp_hl_append_json_field(
 		const char *index_name)
 {
 	TpHighlightRanges ranges;
+	TpOffsetMap		 *omap = NULL;
 	text			 *snippet;
 	int				  i;
 
 	{
 		text *hl_doc = field_text;
 		tp_hl_collect(
-				field_text, query, index_name, field_name, &ranges, &hl_doc);
+				field_text, query, index_name, field_name,
+				&ranges, &hl_doc, &omap);
 		snippet = tp_hl_render_snippet(
 				hl_doc, &ranges, "<b>", "</b>", 150, -1, 0);
 	}
@@ -1106,22 +1170,25 @@ tp_hl_append_json_field(
 	appendStringInfoString(out, ",\"positions\":[");
 	for (i = 0; i < ranges.count; i++)
 	{
+		int start = tp_hl_map_start(omap, ranges.items[i].start);
+		int end	  = tp_hl_map_end(omap, ranges.items[i].end);
 		if (i > 0)
 			appendStringInfoChar(out, ',');
-		appendStringInfo(
-				out, "[%d,%d]", ranges.items[i].start, ranges.items[i].end);
+		appendStringInfo(out, "[%d,%d]", start, end);
 	}
 	appendStringInfoString(out, "],\"matches\":[");
 	for (i = 0; i < ranges.count; i++)
 	{
 		TpHighlightRange *range = &ranges.items[i];
+		int start = tp_hl_map_start(omap, range->start);
+		int end	  = tp_hl_map_end(omap, range->end);
 		if (i > 0)
 			appendStringInfoChar(out, ',');
 		appendStringInfo(
 				out,
 				"{\"start\":%d,\"end\":%d,\"term\":",
-				range->start,
-				range->end);
+				start,
+				end);
 		tp_hl_json_escape(out, range->term);
 		appendStringInfoString(out, ",\"matched_text\":");
 		tp_hl_json_escape(out, range->matched_text);

@@ -454,13 +454,13 @@ FROM markup_md WHERE id = 4;
 -- 18. Snippet positions on normalized content
 -- ============================================================
 
--- HTML: positions are against normalized (stripped) text
+-- HTML: positions are against original text
 SELECT bm25_snippet_positions(
   content,
   to_bm25query('friend', 'markup_html_idx'))
 FROM markup_html WHERE id = 1;
 
--- Markdown: positions against normalized text
+-- Markdown: positions against original text
 SELECT bm25_snippet_positions(
   content,
   to_bm25query('bold', 'markup_md_idx'))

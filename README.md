@@ -1,10 +1,9 @@
 # pg_textsearch
 
-[![CI](https://github.com/timescale/pg_textsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/timescale/pg_textsearch/actions/workflows/ci.yml)
-[![Benchmarks](https://github.com/timescale/pg_textsearch/actions/workflows/benchmark.yml/badge.svg)](https://timescale.github.io/pg_textsearch/benchmarks/)
-[![Coverity Scan](https://scan.coverity.com/projects/32822/badge.svg)](https://scan.coverity.com/projects/pg_textsearch)
+[![CI](https://github.com/GerardSmit/pg_textsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/GerardSmit/pg_textsearch/actions/workflows/ci.yml)
+[![Docker](https://github.com/GerardSmit/pg_textsearch/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/GerardSmit/pg_textsearch/actions/workflows/docker-publish.yml)
 
-Modern ranked text search for Postgres.
+Modern ranked text search for Postgres. Fork of [timescale/pg_textsearch](https://github.com/timescale/pg_textsearch) with additional features and a Docker-first distribution.
 
 - Simple syntax: `ORDER BY content <@> 'search terms'`
 - BM25 ranking with configurable parameters (k1, b)
@@ -14,65 +13,64 @@ Modern ranked text search for Postgres.
 - Fast top-k queries via Block-Max WAND optimization
 - Parallel index builds for large tables
 - Supports partitioned tables
-- Best in class performance and scalability
-- **Advanced queries** (2.0.0+): prefix (`foo*`), phrase (`"foo bar"`),
+- **Advanced queries**: prefix (`foo*`), phrase (`"foo bar"`),
   field-scoped (`title:foo`), and fuzzy (`fuzzy_max_distance => 1`) —
   all via `to_bm25query(..., grammar => true)`
-- **Highlighting**: `bm25_snippet()` for search result snippets with
-  byte-offset positions
+- **Highlighting**: `bm25_snippet()` for search result snippets,
+  `bm25_snippet_positions()` for byte-offset ranges,
+  `bm25_highlights()` for structured JSON output across multi-column indexes
+- **Content normalization**: index HTML and Markdown content with automatic
+  tag/syntax stripping via `content_format` index option
 - **Parallel index scan** for 10M+ row indexes (up to 3x speedup)
-
-🚀 **Status**: v2.0.0 - Pre-production.
+- **Bundled extensions**: pgvector (vector similarity search) and pg_trgm
+  (trigram matching) pre-installed in Docker image
 
 ![Tapir and Friends](images/tapir_and_friends_v1.1.0.png)
 
-## Historical note
-
-The original name of the project was Tapir - **T**extual **A**nalysis for **P**ostgres **I**nformation **R**etrieval.  We still use the tapir as our
-mascot and the name occurs in various places in the source code.
-
 ## PostgreSQL Version Compatibility
 
-pg_textsearch supports PostgreSQL 17 and 18.
+pg_textsearch supports PostgreSQL 18.
 
 ## Installation
 
-### Pre-built Binaries
+### Docker (recommended)
 
-Download pre-built binaries from the
-[Releases page](https://github.com/timescale/pg_textsearch/releases).
-Available for Linux and macOS (amd64 and arm64), PostgreSQL 17 and 18.
-
-### Build from Source
+The Docker image includes Postgres 18, pg_textsearch, pgvector, and pg_trgm,
+all pre-configured with `shared_preload_libraries` and auto-created on first start.
 
 ```sh
-cd /tmp
-git clone https://github.com/timescale/pg_textsearch
-cd pg_textsearch
-make
-make install # may need sudo
-```
-
-### Docker
-
-A turnkey Docker image bakes Postgres 17 + pg_textsearch + the
-required `shared_preload_libraries` config and auto-creates the
-extension on first start.
-
-```sh
-# Build
-docker build -t pg_textsearch:1.2.0 .
+# Pull from Docker Hub
+docker pull gerardsmit/pg_textsearch:latest
 
 # Run
-docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=secret pg_textsearch:1.2.0
+docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=secret gerardsmit/pg_textsearch
 
 # Connect
 psql -h localhost -U postgres
 ```
 
-The extension is created automatically in the default `postgres`
-database. To use it in another database, run `CREATE EXTENSION
-pg_textsearch;` after `CREATE DATABASE`.
+All three extensions are created automatically in the default `postgres`
+database. To use them in another database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+Image tags:
+- `latest` / `pg18` — rolling latest build
+- `pg18-YYYY.MM.DD-SHA` — immutable, pinned to a specific build
+
+### Build from Source
+
+```sh
+cd /tmp
+git clone https://github.com/GerardSmit/pg_textsearch
+cd pg_textsearch
+make
+make install # may need sudo
+```
 
 ## Getting Started
 
@@ -268,7 +266,10 @@ LIMIT 10;
 Positions are `int4range[]` byte offsets (`[start, end)`). Custom tags
 via `start_tag`/`end_tag`, fragment length via `max_num_chars`.
 
-JSON helper for multi-column indexes:
+#### `bm25_highlights` — structured JSON output
+
+For multi-column indexes, `bm25_highlights` returns a JSON object with
+per-field snippets, match positions, and matched terms:
 
 ```sql
 SELECT bm25_highlights(
@@ -279,6 +280,73 @@ FROM articles
 ORDER BY (title, body) <@> to_bm25query('title:hello body:search*', 'articles_idx', grammar => true)
 LIMIT 10;
 ```
+
+Returns JSON like:
+
+```json
+{
+  "title": {
+    "snippet": "<b>Hello</b> World",
+    "positions": [[0, 5]],
+    "matches": [
+      {"term": "hello", "start": 0, "end": 5, "match_type": "exact", "matched_text": "Hello"}
+    ]
+  },
+  "body": {
+    "snippet": "Full text <b>search</b> engine",
+    "positions": [[10, 16]],
+    "matches": [
+      {"term": "search", "start": 10, "end": 16, "match_type": "exact", "matched_text": "search"}
+    ]
+  }
+}
+```
+
+Each field entry contains:
+- `snippet` — highlighted text with `<b>` tags (customizable via `start_tag`/`end_tag`)
+- `positions` — `[start, end)` byte offsets of matched terms
+- `matches` — array of match details: term, offsets, match type, and original text
+
+### Content Normalization (HTML / Markdown)
+
+Index HTML or Markdown content and pg_textsearch automatically strips tags
+and syntax during tokenization. Queries match against the visible text only.
+
+```sql
+-- HTML content: tags stripped, entities decoded, script/style/template removed
+CREATE TABLE pages (id int PRIMARY KEY, content text);
+INSERT INTO pages VALUES (1, '<p>Hello <b>world</b> &amp; friends</p>');
+
+CREATE INDEX pages_idx ON pages USING bm25(content)
+    WITH (text_config = 'english', content_format = 'html');
+
+-- Searches visible text, not tags
+SELECT * FROM pages
+ORDER BY content <@> to_bm25query('friends', 'pages_idx')
+LIMIT 5;
+
+-- Markdown content: headings, bold, links, code blocks stripped
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+INSERT INTO docs VALUES (1, '# Getting Started\n\nSome **bold** text with [a link](http://example.com)');
+
+CREATE INDEX docs_idx ON docs USING bm25(body)
+    WITH (text_config = 'english', content_format = 'markdown');
+```
+
+For multi-column indexes, set per-field formats:
+
+```sql
+CREATE INDEX articles_idx ON articles USING bm25(title, summary, body)
+    WITH (text_config = 'english',
+          content_format = 'title:plain,summary:html,body:markdown');
+```
+
+Valid formats: `plain` (default), `html`, `markdown`.
+
+Snippets (`bm25_snippet`) render against the normalized (stripped) text for
+display. Positions (`bm25_snippet_positions`, `bm25_highlights`) map back to
+byte offsets in the **original** HTML/Markdown source, so callers can
+highlight their stored content directly.
 
 ### Verifying Index Usage
 
@@ -683,29 +751,6 @@ CREATE INDEX custom_idx ON documents USING bm25(content)
 
 ## Limitations
 
-### No Phrase Queries
-
-The BM25 index stores term frequencies but not term positions, so it cannot
-natively evaluate phrase queries like `"database system"`. You can emulate
-phrase matching by combining BM25 ranking with a post-filter:
-
-```sql
--- BM25 ranks candidates; subquery over-fetches to account for
--- post-filter eliminating non-phrase matches
-SELECT * FROM (
-    SELECT *, content <@> 'database system' AS score
-    FROM documents
-    ORDER BY score
-    LIMIT 100  -- over-fetch
-) sub
-WHERE content ILIKE '%database system%'
-ORDER BY score
-LIMIT 10;
-```
-
-Because the post-filter eliminates some results, the inner LIMIT should
-be larger than the desired result count.
-
 ### No Built-in Faceted Search
 
 pg_textsearch does not provide dedicated faceting operators, but standard
@@ -828,7 +873,7 @@ SELECT indexname FROM pg_indexes WHERE indexdef LIKE '%USING bm25%';
 If your machine has multiple Postgres installations, specify the path to `pg_config`:
 
 ```sh
-export PG_CONFIG=/Library/PostgreSQL/18/bin/pg_config  # or 17
+export PG_CONFIG=/Library/PostgreSQL/18/bin/pg_config
 make clean && make && make install
 ```
 
@@ -836,8 +881,7 @@ If you get compilation errors, install Postgres development files:
 
 ```sh
 # Ubuntu/Debian
-sudo apt install postgresql-server-dev-17  # for PostgreSQL 17
-sudo apt install postgresql-server-dev-18  # for PostgreSQL 18
+sudo apt install postgresql-server-dev-18
 ```
 
 ## Reference
@@ -849,6 +893,7 @@ Option | Type | Default | Description
 text_config | string | required | PostgreSQL text search configuration to use
 k1 | real | 1.2 | Term frequency saturation parameter (0.1 to 10.0)
 b | real | 0.75 | Length normalization parameter (0.0 to 1.0)
+content_format | string | plain | Content format: `plain`, `html`, `markdown`, or per-field `col:format,...`
 
 ### Text Search Configurations
 
@@ -896,10 +941,24 @@ These functions are for debugging and development use only. Their interface may
 change in future releases without notice. Functions marked with † require
 superuser privileges.
 
+#### Highlighting Functions
+
+Function | Description
+--- | ---
+bm25_snippet(content, query, ...) → text | Highlighted snippet with `<b>` tags (customizable)
+bm25_snippet(content, query_text, ...) → text | Text-query variant (auto-creates bm25query)
+bm25_snippet_positions(content, query, ...) → int4range[] | Byte-offset ranges of matched terms
+bm25_highlights(query, index_name, VARIADIC columns) → jsonb | Per-field JSON with snippets, positions, and match details
+
+Optional parameters for `bm25_snippet`: `field_name`, `start_tag`, `end_tag`, `max_num_chars`.
+
+#### Maintenance Functions
+
 Function | Description
 --- | ---
 bm25_force_merge(index_name) → void | Merge all segments into one (improves query speed)
 bm25_spill_index(index_name) → int4 | Force memtable spill to disk segment
+bm25_memory_usage() → setof record | Show current memtable memory usage
 bm25_dump_index(index_name) † → text | Dump internal index structure (truncated)
 bm25_summarize_index(index_name) † → text | Show index statistics without content
 
@@ -928,13 +987,13 @@ of indexes (e.g., partitioned tables with hundreds of partitions). If you use
 another Postgres extension that also registers fixed tranche IDs in this range,
 wait event names in `pg_stat_activity` may be incorrect. Core Postgres tranches
 use IDs below 100. If you encounter a conflict, please
-[open an issue](https://github.com/timescale/pg_textsearch/issues).
+[open an issue](https://github.com/GerardSmit/pg_textsearch/issues).
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and
 how to submit pull requests.
 
-- **Bug Reports**: [Create an issue](https://github.com/timescale/pg_textsearch/issues/new?labels=bug&template=bug_report.md)
-- **Feature Requests**: [Request a feature](https://github.com/timescale/pg_textsearch/issues/new?labels=enhancement&template=feature_request.md)
-- **General Discussion**: [Start a discussion](https://github.com/timescale/pg_textsearch/discussions)
+- **Bug Reports**: [Create an issue](https://github.com/GerardSmit/pg_textsearch/issues/new?labels=bug)
+- **Feature Requests**: [Request a feature](https://github.com/GerardSmit/pg_textsearch/issues/new?labels=enhancement)
+- **General Discussion**: [Start a discussion](https://github.com/GerardSmit/pg_textsearch/discussions)
