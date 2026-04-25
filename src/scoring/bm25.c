@@ -128,6 +128,7 @@ tp_score_documents_weighted(
 	BlockNumber		level_heads[TP_MAX_LEVELS];
 	float4			field_weights[TP_MAX_FIELDS];
 	float4			field_avgdls[TP_MAX_FIELDS]; /* BM25F: per-field */
+	float4		   *avgdls;
 	int				i;
 
 	/* Basic sanity checks */
@@ -280,8 +281,6 @@ tp_score_documents_weighted(
 				query_term_count,
 				level_heads,
 				doc_freqs);
-
-		float4 *avgdls;
 
 		/* Convert doc_freqs to IDFs, scaled by per-field weight */
 		idfs   = palloc(query_term_count * sizeof(float4));

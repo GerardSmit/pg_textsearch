@@ -265,16 +265,14 @@ RETURNS @extschema@.bm25query
 AS $fn$
     SELECT @extschema@.to_bm25query(prefix_text OPERATOR(pg_catalog.||) '*', grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
-SET search_path = @extschema@, pg_catalog;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE FUNCTION @extschema@.bm25_prefix(prefix_text text, index_name text)
 RETURNS @extschema@.bm25query
 AS $fn$
     SELECT @extschema@.to_bm25query(prefix_text OPERATOR(pg_catalog.||) '*', index_name, grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
-SET search_path = @extschema@, pg_catalog;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
 
 -- Phrase builder: bm25_phrase(ARRAY['foo','bar']) → '"foo bar"'.
 -- Tokens are joined with single spaces; whitespace inside individual
@@ -291,8 +289,7 @@ AS $fn$
                 OPERATOR(pg_catalog.||) '"', grammar => true)
     END
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
-SET search_path = @extschema@, pg_catalog;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE FUNCTION @extschema@.bm25_phrase(tokens text[], index_name text)
 RETURNS @extschema@.bm25query
@@ -302,8 +299,7 @@ AS $fn$
             OPERATOR(pg_catalog.||) '"',
         index_name, grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
-SET search_path = @extschema@, pg_catalog;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
 
 -- Phrase-prefix builder: bm25_phrase_prefix(ARRAY['foo','bar']) →
 -- '"foo bar*"'. The final token gets the trailing '*' marker.
@@ -322,8 +318,7 @@ AS $fn$
         tokens[pg_catalog.array_length(tokens, 1)]
         OPERATOR(pg_catalog.||) '*"', grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
-SET search_path = @extschema@, pg_catalog;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE FUNCTION @extschema@.bm25_phrase_prefix(tokens text[], index_name text)
 RETURNS @extschema@.bm25query
@@ -341,8 +336,7 @@ AS $fn$
         OPERATOR(pg_catalog.||) '*"',
         index_name, grammar => true)
 $fn$
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
-SET search_path = @extschema@, pg_catalog;
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
 
 -- Highlighting helpers. Positions are byte offsets represented as
 -- half-open int4range values: [start_byte, end_byte).

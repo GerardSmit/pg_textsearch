@@ -816,7 +816,14 @@ jobs:
         # Check the current version's base install SQL file
         VERSION=$(awk -F"'" '/default_version/ {print $2}' pg_textsearch.control)
         echo "Checking sql/pg_textsearch--${VERSION}.sql"
-        pgspot "sql/pg_textsearch--${VERSION}.sql"
+        pgspot \
+          --proc-without-search-path "extschema.bm25_prefix(prefix_text text)" \
+          --proc-without-search-path "extschema.bm25_prefix(prefix_text text,index_name text)" \
+          --proc-without-search-path "extschema.bm25_phrase(tokens text[])" \
+          --proc-without-search-path "extschema.bm25_phrase(tokens text[],index_name text)" \
+          --proc-without-search-path "extschema.bm25_phrase_prefix(tokens text[])" \
+          --proc-without-search-path "extschema.bm25_phrase_prefix(tokens text[],index_name text)" \
+          "sql/pg_textsearch--${VERSION}.sql"
 
   # Umbrella job for branch protection rules
   all-tests-passed:

@@ -725,10 +725,10 @@ tp_write_segment_from_build_ctx(TpBuildContext *ctx, Relation index)
 				while ((nread = tp_expull_reader_read(
 								&ereader, entry_buf, 32)) > 0)
 				{
-					uint32 i;
-					for (i = 0; i < nread; i++)
+					uint32 j;
+					for (j = 0; j < nread; j++)
 					{
-						uint32 freq = entry_buf[i].frequency;
+						uint32 freq = entry_buf[j].frequency;
 						if (pos_cursor + freq >
 							terms[term_idx].positions_count)
 							freq = terms[term_idx].positions_count -
@@ -1274,10 +1274,10 @@ tp_write_segment_to_buffile(TpBuildContext *ctx, BufFile *file)
 				while ((nread = tp_expull_reader_read(
 								&ereader, entry_buf, 32)) > 0)
 				{
-					uint32 i;
-					for (i = 0; i < nread; i++)
+					uint32 j;
+					for (j = 0; j < nread; j++)
 					{
-						uint32 freq = entry_buf[i].frequency;
+						uint32 freq = entry_buf[j].frequency;
 						if (pos_cursor + freq >
 							terms[term_idx].positions_count)
 							freq = terms[term_idx].positions_count -

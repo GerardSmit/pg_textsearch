@@ -1776,8 +1776,9 @@ bm25_textarray_text_score(PG_FUNCTION_ARGS)
 			(errcode(ERRCODE_UNDEFINED_OBJECT),
 			 errmsg("no BM25 index found for text[] <@> text "
 					"expression"),
-			 errdetail("Create a BM25 index on the column or "
-					   "use ORDER BY."),
+			 errdetail(
+					 "Create a BM25 index on the column or "
+					 "use ORDER BY."),
 			 errhint("SELECT col <@> to_bm25query('q', 'idx') "
 					 "AS score")));
 

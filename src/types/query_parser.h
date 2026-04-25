@@ -27,9 +27,9 @@
 
 typedef enum
 {
-	TP_QTERM_TERM,	 /* regular term — tokenize via text_config */
-	TP_QTERM_PREFIX, /* prefix term — strip *, lowercase, dict-expand */
-	TP_QTERM_PHRASE, /* "foo bar" — quoted ordered-adjacent sequence */
+	TP_QTERM_TERM,			/* regular term — tokenize via text_config */
+	TP_QTERM_PREFIX,		/* prefix term — strip *, lowercase, dict-expand */
+	TP_QTERM_PHRASE,		/* "foo bar" — quoted ordered-adjacent sequence */
 	TP_QTERM_PHRASE_PREFIX, /* "foo bar*" — phrase whose final token is a
 							   prefix */
 } TpQueryTermKind;

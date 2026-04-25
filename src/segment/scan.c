@@ -1270,11 +1270,12 @@ tp_segment_collect_positions_batch(
 
 			while (tp_segment_posting_iterator_next(&iter, &posting))
 			{
-				uint16 freq = posting->frequency;
-				int	   idx;
+				uint16			freq = posting->frequency;
+				int				idx;
+				ItemPointerData local_ctid = posting->ctid;
 
 				idx = seg_ctid_bsearch(
-						sorted_targets, num_targets, &posting->ctid);
+						sorted_targets, num_targets, &local_ctid);
 
 				if (is_varint)
 				{

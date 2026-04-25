@@ -251,8 +251,14 @@ tp_phrase_postfilter_candidates(
 	int					 out_count = 0;
 	int					 i;
 	bool				 indexed_is_array;
-	bool				 heap_available	 = false;
-	char			  ***stemmed_clauses = NULL;
+	bool				 heap_available	   = false;
+	char			  ***stemmed_clauses   = NULL;
+	ItemPointerData		*sorted_cands	   = NULL;
+	int					*cand_orig_idx	   = NULL;
+	int					 num_valid_cands   = 0;
+	uint32			 ****clause_positions  = NULL;
+	uint32			  ***clause_counts	   = NULL;
+	bool				 any_phrase_clause = false;
 
 	if (pq == NULL || in_count == 0)
 		return;
@@ -373,12 +379,6 @@ tp_phrase_postfilter_candidates(
 	 * For PHRASE_PREFIX clauses we skip the batch (always fall back
 	 * to heap re-tokenize today). Tracked in the "follow-up" section.
 	 */
-	ItemPointerData *sorted_cands	   = NULL;
-	int				*cand_orig_idx	   = NULL;
-	int				 num_valid_cands   = 0;
-	uint32		 ****clause_positions  = NULL;
-	uint32		  ***clause_counts	   = NULL;
-	bool			 any_phrase_clause = false;
 
 	for (i = 0; i < pq->term_count && !any_phrase_clause; i++)
 		if (pq->terms[i].kind == TP_QTERM_PHRASE)
