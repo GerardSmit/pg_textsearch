@@ -2,6 +2,7 @@ name: Docker Publish
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   schedule:
     - cron: '0 4 * * 1'
@@ -26,11 +27,25 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Generate tags
-      id: meta
+    - name: Generate date/sha
+      id: vars
       run: |
         echo "date=$(date +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
         echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Compute image tags
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.IMAGE_NAME }}
+        tags: |
+          type=semver,pattern={{version}},prefix=pg18-
+          type=semver,pattern={{major}}.{{minor}},prefix=pg18-
+          type=semver,pattern={{major}},prefix=pg18-
+          type=raw,value=pg18-${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.sha }}
+          type=raw,value=pg18-${{ steps.vars.outputs.date }}
+          type=raw,value=pg18
+          type=raw,value=latest
 
     - name: Get existing image digest
       id: existing
@@ -57,10 +72,7 @@ jobs:
         context: .
         push: true
         platforms: linux/amd64,linux/arm64
-        tags: |
-          ${{ env.IMAGE_NAME }}:pg18-${{ steps.meta.outputs.date }}-${{ steps.meta.outputs.sha }}
-          ${{ env.IMAGE_NAME }}:pg18-${{ steps.meta.outputs.date }}
-          ${{ env.IMAGE_NAME }}:pg18
-          ${{ env.IMAGE_NAME }}:latest
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max

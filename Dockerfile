@@ -39,8 +39,20 @@ FROM postgres:18-bookworm
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      gnupg \
+      lsb-release \
+ && install -d /usr/share/keyrings \
+ && curl -fsSL https://packagecloud.io/timescale/timescaledb/gpgkey \
+      | gpg --dearmor -o /usr/share/keyrings/timescaledb.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/timescaledb.gpg] https://packagecloud.io/timescale/timescaledb/debian/ $(lsb_release -cs) main" \
+      > /etc/apt/sources.list.d/timescaledb.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
       libxml2 \
       postgresql-18-pgvector \
+      timescaledb-2-postgresql-18 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /usr/lib/postgresql/18/lib/pg_textsearch.so \
@@ -52,10 +64,11 @@ COPY --from=build /usr/lib/postgresql/18/lib/bitcode/pg_textsearch.index.bc \
 COPY --from=build /usr/share/postgresql/18/extension/pg_textsearch* \
      /usr/share/postgresql/18/extension/
 
-ENV POSTGRES_INITDB_ARGS="-c shared_preload_libraries=pg_textsearch"
+ENV POSTGRES_INITDB_ARGS="-c shared_preload_libraries=timescaledb,pg_textsearch"
 
 RUN mkdir -p /docker-entrypoint-initdb.d \
  && printf '%s\n' \
+      'CREATE EXTENSION IF NOT EXISTS timescaledb;' \
       'CREATE EXTENSION IF NOT EXISTS pg_textsearch;' \
       'CREATE EXTENSION IF NOT EXISTS vector;' \
       'CREATE EXTENSION IF NOT EXISTS pg_trgm;' \
