@@ -69,6 +69,20 @@ jobs:
         make PG_CFLAGS="-Werror -Wno-error=unused-parameter"
         sudo env "PATH=$PATH" make install
 
+    - name: Stage release artifact
+      run: |
+        export PATH="/usr/lib/postgresql/${{ matrix.pg_version }}/bin:$PATH"
+        rm -rf stage
+        make install DESTDIR="$PWD/stage"
+        version=$(awk -F"'" '/default_version/ {print $2}' pg_textsearch.control)
+        tar -czf "pg_textsearch-${version}-pg${{ matrix.pg_version }}-linux-amd64.tar.gz" -C stage .
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: pg_textsearch-pg${{ matrix.pg_version }}
+        path: pg_textsearch-*-pg${{ matrix.pg_version }}-linux-amd64.tar.gz
+        if-no-files-found: error
+
     - name: Run regression tests
       timeout-minutes: 10
       run: |
@@ -824,6 +838,53 @@ jobs:
           --proc-without-search-path "extschema.bm25_phrase_prefix(tokens text[])" \
           --proc-without-search-path "extschema.bm25_phrase_prefix(tokens text[],index_name text)" \
           "sql/pg_textsearch--${VERSION}.sql"
+
+  release:
+    needs: [test, build-test-multiple-configs, performance-test, format-check, sanitizer, coverage, pgspot]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        name: Resolve version from pg_textsearch.control
+        run: |
+          v=$(awk -F"'" '/default_version/ {print $2}' pg_textsearch.control)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+
+      - id: tag_check
+        name: Check whether tag already exists
+        run: |
+          if git rev-parse "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.version.outputs.tag }} already exists - skipping release."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.tag_check.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: pg_textsearch-pg*
+          merge-multiple: true
+
+      - if: steps.tag_check.outputs.exists == 'false'
+        name: Create tag + GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "pg_textsearch ${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            artifacts/*.tar.gz
 
   # Umbrella job for branch protection rules
   all-tests-passed:
