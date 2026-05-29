@@ -1149,19 +1149,47 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 				 * find tf in that field's tsvector and use that field's
 				 * length.  Otherwise fall back to the flattened tsvector
 				 * (current behavior, an approximation).
+				 *
+				 * Important: tsvectors built from raw text have plain
+				 * (untagged) lexemes.  The tag byte that prefixes multi-
+				 * col terms in the index dictionary must be stripped
+				 * before looking up the term frequency in the per-field
+				 * tsvector (which is built by to_tsvector_byid and
+				 * contains only bare lexemes with no tag prefix).
 				 */
 				if (tag_field_idx >= 0 && tp_bm25f_doc_ctx != NULL &&
 					tag_field_idx < tp_bm25f_doc_ctx->num_fields &&
 					tp_bm25f_doc_ctx->field_tsvectors[tag_field_idx] != NULL)
 				{
+					/*
+					 * Record-LHS (multi-col) path: strip the leading tag
+					 * byte before looking up in the per-field tsvector.
+					 * Per-field tsvectors are built by to_tsvector_byid
+					 * and contain bare (untagged) lexemes.
+					 */
+					const char *untagged_term = term + 1;
+					int			untagged_len  = tlen - 1;
+
 					tf = find_term_frequency_by_text(
 							tp_bm25f_doc_ctx->field_tsvectors[tag_field_idx],
-							term,
-							tlen);
+							untagged_term,
+							untagged_len);
 					term_doc_length =
 							tp_bm25f_doc_ctx->field_lengths[tag_field_idx];
 					if (term_doc_length <= 0)
 						term_doc_length = 1;
+				}
+				else if (tag_field_idx >= 0)
+				{
+					/*
+					 * Text-LHS path against a multi-col index: the
+					 * resolved term carries a field tag byte but the
+					 * document tsvector is built from plain text and
+					 * has no tags.  Strip the tag byte so the lookup
+					 * can succeed.
+					 */
+					tf = find_term_frequency_by_text(
+							tsvector, term + 1, tlen - 1);
 				}
 				else
 				{

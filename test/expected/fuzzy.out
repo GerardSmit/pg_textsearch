@@ -136,7 +136,8 @@ SELECT id FROM fuzzy_mc
   ORDER BY id;
  id 
 ----
-(0 rows)
+  1
+(1 row)
 
 -- 2. Fuzzy with a very long term (100+ chars) — should return no matches.
 SELECT count(*)
