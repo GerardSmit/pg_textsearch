@@ -69,7 +69,7 @@ src/vendor/md4c/md4c.o: PG_CPPFLAGS += -w
 # PG_CPPFLAGS += -DDEBUG_DUMP_INDEX
 
 # Test configuration
-REGRESS = abort aerodocs basic binary_io bmw bulk_load catalog_stats compression concurrent_build coverage deletion vacuum vacuum_bitmap vacuum_extended vacuum_rebuild dropped empty explicit_index expression_index field_weights bm25f_validation force_merge fuzzy highlight implicit index inheritance limits lock manyterms markup max_shared_memory memory merge mixed multicol parallel_build parallel_bmw parallel_scan partitioned partitioned_many partial_index pgstats positions positions_stress prefix phrase phrase_prefix queries quoted_identifiers record_lhs rescan schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security segment segment_integrity strings temp_table text_array text_config unsupported updates vector unlogged_index wand
+REGRESS = abort aerodocs basic binary_io bmw bmw_skip_advance bulk_load catalog_stats compression concurrent_build coverage deletion vacuum vacuum_bitmap vacuum_extended vacuum_rebuild dropped empty explicit_index expression_index field_weights bm25f_validation force_merge fuzzy highlight implicit index inheritance limits lock manyterms markup max_shared_memory memory merge mixed multicol parallel_build parallel_bmw parallel_scan partitioned partitioned_many partial_index pgstats positions positions_stress prefix phrase phrase_prefix queries quoted_identifiers record_lhs rescan schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security segment segment_integrity strings temp_table text_array text_config unsupported updates vector unlogged_index wand
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG = pg_config
