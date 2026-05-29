@@ -1308,11 +1308,12 @@ tp_process_document_text(
 		int32			  *doc_length_out,
 		uint8			   content_format)
 {
-	char  *document_str;
-	char **terms;
-	int32 *frequencies;
-	int	   term_count;
-	int	   doc_length;
+	char	*document_str;
+	char   **terms;
+	int32	*frequencies;
+	uint32 **positions = NULL;
+	int		 term_count;
+	int		 doc_length;
 
 	if (!document_text || !index_state)
 		return false;
@@ -1330,13 +1331,38 @@ tp_process_document_text(
 		return false;
 	}
 
-	/*
-	 * Tokenize document (chunks oversized inputs to fit tsvector cap).
-	 * Positions are not returned; oversized docs cannot track positions
-	 * accurately across chunks, and this path is for aminsert/recovery.
-	 */
-	doc_length = tp_tokenize_text(
-			document_text, text_config_oid, &terms, &frequencies, &term_count);
+	if (VARSIZE_ANY_EXHDR(document_text) <= TP_TSVECTOR_CHUNK_BYTES)
+	{
+		/*
+		 * Small document: normal path preserving positions so phrase
+		 * queries work on rows inserted via aminsert / replayed during
+		 * recovery, not just on docs seen at CREATE INDEX time.
+		 */
+		Datum	 tsvector_datum;
+		TSVector tsvector;
+		tsvector_datum = DirectFunctionCall2Coll(
+				to_tsvector_byid,
+				InvalidOid,
+				ObjectIdGetDatum(text_config_oid),
+				PointerGetDatum(document_text));
+		tsvector   = DatumGetTSVector(tsvector_datum);
+		doc_length = tp_extract_terms_from_tsvector(
+				tsvector, &terms, &frequencies, &positions, &term_count);
+	}
+	else
+	{
+		/*
+		 * Oversized document: chunked tokenization to fit the tsvector
+		 * 1 MB lexeme-dictionary cap. Positions cannot be reliably
+		 * merged across chunks, so they are omitted.
+		 */
+		doc_length = tp_tokenize_text(
+				document_text,
+				text_config_oid,
+				&terms,
+				&frequencies,
+				&term_count);
+	}
 
 	if (term_count > 0)
 	{
@@ -1352,7 +1378,7 @@ tp_process_document_text(
 				ctid,
 				terms,
 				frequencies,
-				NULL,
+				positions,
 				term_count,
 				doc_length,
 				NULL,
@@ -1368,6 +1394,8 @@ tp_process_document_text(
 		/* Free the terms array and individual lexemes */
 		tp_free_terms_array(terms, term_count);
 		pfree(frequencies);
+		if (positions != NULL)
+			tp_free_term_positions(positions, term_count);
 	}
 
 	if (doc_length_out)

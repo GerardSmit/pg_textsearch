@@ -1184,12 +1184,15 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 					/*
 					 * Text-LHS path against a multi-col index: the
 					 * resolved term carries a field tag byte but the
-					 * document tsvector is built from plain text and
-					 * has no tags.  Strip the tag byte so the lookup
-					 * can succeed.
+					 * document term array is built from plain text and
+					 * has no tags.  Strip the tag byte (term + 1 stays
+					 * null-terminated) so the lookup can succeed.
 					 */
-					tf = find_term_frequency_by_text(
-							tsvector, term + 1, tlen - 1);
+					tf = find_term_frequency_in_arrays(
+							doc_terms,
+							doc_frequencies,
+							doc_term_count,
+							term + 1);
 				}
 				else
 				{
