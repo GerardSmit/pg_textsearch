@@ -407,8 +407,6 @@ tp_vacuum_rebuild_segment(
 		Buffer			heap_buf = InvalidBuffer;
 		bool			valid;
 		text		   *document_text;
-		Datum			tsvector_datum;
-		TSVector		tsvector;
 		char		  **terms;
 		int32		   *frequencies;
 		uint32		  **positions = NULL;
@@ -464,15 +462,34 @@ tp_vacuum_rebuild_segment(
 		document_text = tp_normalize_markup(
 				document_text, (TpContentFormat)vac_field_format);
 
-		tsvector_datum = DirectFunctionCall2Coll(
-				to_tsvector_byid,
-				InvalidOid,
-				ObjectIdGetDatum(text_config_oid),
-				PointerGetDatum(document_text));
-		tsvector = DatumGetTSVector(tsvector_datum);
-
-		doc_length = tp_extract_terms_from_tsvector(
-				tsvector, &terms, &frequencies, &positions, &term_count);
+		if (VARSIZE_ANY_EXHDR(document_text) <= TP_TSVECTOR_CHUNK_BYTES)
+		{
+			/* Small document: normal path preserving positions. */
+			Datum	 tsvector_datum;
+			TSVector tsvector;
+			tsvector_datum = DirectFunctionCall2Coll(
+					to_tsvector_byid,
+					InvalidOid,
+					ObjectIdGetDatum(text_config_oid),
+					PointerGetDatum(document_text));
+			tsvector   = DatumGetTSVector(tsvector_datum);
+			doc_length = tp_extract_terms_from_tsvector(
+					tsvector, &terms, &frequencies, &positions, &term_count);
+		}
+		else
+		{
+			/*
+			 * Oversized document: chunked tokenization to avoid the
+			 * tsvector 1 MB lexeme-dictionary cap. Positions cannot be
+			 * reliably merged across chunks, so they are omitted.
+			 */
+			doc_length = tp_tokenize_text(
+					document_text,
+					text_config_oid,
+					&terms,
+					&frequencies,
+					&term_count);
+		}
 
 		MemoryContextSwitchTo(old_ctx);
 

@@ -652,10 +652,6 @@ to_tpvector(PG_FUNCTION_ARGS)
 	Oid				text_config_oid;
 	Relation		index_rel = NULL;
 	TpIndexMetaPage metap	  = NULL;
-	text		   *config_text;
-	Datum			tsvector_datum;
-	TSVector		tsvector;
-	WordEntry	   *we;
 	int				i;
 	char		  **lexemes;
 	int32		   *frequencies;
@@ -687,83 +683,24 @@ to_tpvector(PG_FUNCTION_ARGS)
 	/* Get the metapage to extract text_config_oid */
 	metap = tp_get_metapage(index_rel);
 
-	/* Get the text config OID and name */
+	/* Get the text config OID */
 	text_config_oid = metap->text_config_oid;
-
-	if (OidIsValid(text_config_oid))
-	{
-		/* Use the stored text config OID - convert to regconfig text */
-		char *config_cstr = DatumGetCString(DirectFunctionCall1(
-				regconfigout, ObjectIdGetDatum(text_config_oid)));
-
-		config_text = cstring_to_text(config_cstr);
-		pfree(config_cstr);
-	}
-	else
-	{
-		/* No configuration found, use default */
-		config_text		= cstring_to_text("english");
-		text_config_oid = InvalidOid;
-	}
+	if (!OidIsValid(text_config_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("index \"%s\" has no text search configuration",
+						index_name)));
 
 	/* Clean up index relation and metapage */
 	pfree(metap);
 	index_close(index_rel, AccessShareLock);
 
-	/* Use to_tsvector to process the text */
-
 	/*
-	 * Call to_tsvector with config OID - use to_tsvector_byid for direct OID
-	 * call
+	 * Tokenize using tp_tokenize_text so that documents larger than the
+	 * tsvector 1 MB lexeme-dictionary cap are handled via chunking.
 	 */
-	if (OidIsValid(text_config_oid))
-	{
-		/* Use the OID directly */
-		tsvector_datum = DirectFunctionCall2(
-				to_tsvector_byid,
-				ObjectIdGetDatum(text_config_oid),
-				PointerGetDatum(input_text));
-	}
-	else
-	{
-		/* Fallback to using text config name */
-		tsvector_datum = DirectFunctionCall2(
-				to_tsvector,
-				PointerGetDatum(config_text),
-				PointerGetDatum(input_text));
-	}
-	tsvector = DatumGetTSVector(tsvector_datum);
-
-	/* Count entries and allocate arrays */
-	entry_count = tsvector->size;
-	if (entry_count > 0)
-	{
-		lexemes		= palloc(entry_count * sizeof(char *));
-		frequencies = palloc(entry_count * sizeof(int32));
-
-		/* Extract lexemes and frequencies from tsvector */
-		we = ARRPTR(tsvector);
-		for (i = 0; i < entry_count; i++)
-		{
-			char *lexeme_start = STRPTR(tsvector) + we[i].pos;
-			int	  lexeme_len   = we[i].len;
-
-			lexemes[i] = palloc(lexeme_len + 1);
-			memcpy(lexemes[i], lexeme_start, lexeme_len);
-			lexemes[i][lexeme_len] = '\0';
-
-			/* Count positions as frequency (or 1 if no positions) */
-			if (we[i].haspos)
-				frequencies[i] = POSDATALEN(tsvector, &we[i]);
-			else
-				frequencies[i] = 1;
-		}
-	}
-	else
-	{
-		lexemes		= NULL;
-		frequencies = NULL;
-	}
+	(void)tp_tokenize_text(
+			input_text, text_config_oid, &lexemes, &frequencies, &entry_count);
 
 	/* Create the tpvector */
 	result = create_tpvector_from_strings(
@@ -779,7 +716,6 @@ to_tpvector(PG_FUNCTION_ARGS)
 	if (frequencies)
 		pfree(frequencies);
 	pfree(index_name);
-	/* Don't free StringInfo data - it's managed by memory context */
 
 	PG_RETURN_POINTER(result);
 }

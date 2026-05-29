@@ -7,6 +7,7 @@
 #include <postgres.h>
 
 #include <math.h>
+#include <miscadmin.h>
 #include <utils/hsearch.h>
 #include <utils/memutils.h>
 
@@ -449,6 +450,9 @@ score_memtable_single_term(
 			int32			 doc_len;
 			float4			 score;
 
+			if ((i & 0xFFF) == 0)
+				CHECK_FOR_INTERRUPTS();
+
 			if (field_idx >= 0)
 				doc_len = tp_source_get_doc_field_length(
 						source, ctid, field_idx);
@@ -519,6 +523,8 @@ score_segment_single_term_bmw(
 	{
 		float4 threshold = tp_topk_threshold(heap);
 		float4 block_max = block_max_scores[i];
+
+		CHECK_FOR_INTERRUPTS();
 
 		/* Skip block if it can't beat threshold */
 		if (block_max < threshold)
@@ -670,6 +676,8 @@ tp_score_single_term_bmw(
 	{
 		TpSegmentReader *reader = tp_segment_open(index, roots[i]);
 
+		CHECK_FOR_INTERRUPTS();
+
 		score_segment_single_term_bmw(
 				&heap, reader, term, idf, k1, b, avg_doc_len, stats);
 
@@ -780,6 +788,14 @@ score_memtable_multi_term(
 			DocumentScoreEntry *entry;
 			bool				found;
 
+			/*
+			 * CHECK every 4096 postings; this loop can be very
+			 * long when the memtable holds millions of postings
+			 * -- gating amortizes the overhead.
+			 */
+			if ((i & 0xFFF) == 0)
+				CHECK_FOR_INTERRUPTS();
+
 			/* BM25F: per-field length for tagged terms */
 			if (ts->field_idx >= 0)
 			{
@@ -877,6 +893,19 @@ advance_term_iterator(TpTermState *ts)
  * Uses pre-loaded block_last_doc_ids for O(log blocks) in-memory binary
  * search, avoiding I/O during the search. Only loads the target block from
  * disk.
+ *
+ * Post-condition on `return true`: ts->cur_doc_id >= target_doc_id.
+ *
+ * Both the in-block linear scan and the binary-search-selected block can
+ * exhaust without finding doc >= target if the cached skip data
+ * (skip_entry.last_doc_id, block_last_doc_ids[]) is inconsistent with
+ * on-disk block_postings -- a condition observed on MS MARCO under
+ * concurrent-insert segment topology. In that case we keep loading
+ * subsequent blocks until we find one whose linear scan succeeds, or we
+ * exhaust the iterator. Without this guarantee, callers like seek_to_pivot
+ * spin forever (gdb stack on the production hang showed
+ * seek_to_pivot with cur_doc_id < pivot_doc_id after a `return true`
+ * from this function).
  */
 static bool
 seek_term_to_doc(TpTermState *ts, uint32 target_doc_id)
@@ -889,12 +918,17 @@ seek_term_to_doc(TpTermState *ts, uint32 target_doc_id)
 		return false;
 
 	/*
-	 * Check if target is in current block - if so, linear scan is faster
-	 * than the seek overhead.
+	 * Fast path: target is in (or before) the current block, per the
+	 * cached last_doc_id. Linear-scan from current_in_block.
+	 *
+	 * If the cached last_doc_id is accurate, the loop below will find a
+	 * doc >= target before exhausting the block. If it is *not* accurate
+	 * (i.e., last_doc_id >= target but no posting in the block is >=
+	 * target), the loop falls through and the block-advancing loop below
+	 * picks up where we left off.
 	 */
 	if (target_doc_id <= ts->iter.skip_entry.last_doc_id)
 	{
-		/* Target is in current block, linear scan within block */
 		while (ts->iter.current_in_block < ts->iter.skip_entry.doc_count)
 		{
 			uint32 doc_id =
@@ -906,7 +940,88 @@ seek_term_to_doc(TpTermState *ts, uint32 target_doc_id)
 			}
 			ts->iter.current_in_block++;
 		}
-		/* Exhausted current block, fall through to load next */
+		/* Fall through: advance past current block. */
+	}
+	else
+	{
+		/*
+		 * Target is past current block's cached last_doc_id. Binary
+		 * search the per-term skip cache to find the first block whose
+		 * last_doc_id >= target.
+		 */
+		block_count = ts->iter.dict_entry.block_count;
+		left		= ts->iter.current_block + 1;
+		right		= (int)block_count - 1;
+
+		while (left < right)
+		{
+			mid = left + (right - left) / 2;
+			if (ts->block_last_doc_ids[mid] < target_doc_id)
+				left = mid + 1;
+			else
+				right = mid;
+		}
+		target_block = left;
+
+		if (target_block >= block_count)
+		{
+			ts->iter.finished = true;
+			ts->cur_doc_id	  = UINT32_MAX;
+			return false;
+		}
+
+		/* Position at the start of the binary-search-selected block. */
+		ts->iter.current_block	  = target_block;
+		ts->iter.current_in_block = 0;
+		if (!tp_segment_posting_iterator_load_block(&ts->iter))
+		{
+			ts->iter.finished = true;
+			ts->cur_doc_id	  = UINT32_MAX;
+			return false;
+		}
+	}
+
+	/*
+	 * Block-advancing scan loop. Keep loading subsequent blocks until
+	 * we find a posting >= target_doc_id or exhaust the iterator.
+	 *
+	 * This loop is the durable post-condition guarantor: it terminates
+	 * only by finding doc >= target (and returning true) or by
+	 * exhausting all blocks (and returning false). It does not rely on
+	 * cached skip data being consistent with block_postings -- if a
+	 * block's actual postings are all < target despite a cached
+	 * last_doc_id >= target, we simply move on to the next block.
+	 *
+	 * Termination: each iteration of the outer loop strictly increments
+	 * current_block, bounded by dict_entry.block_count. The inner
+	 * while-loop scans a single block, bounded by skip_entry.doc_count.
+	 */
+	for (;;)
+	{
+		/*
+		 * Cancelability: each iteration of the outer loop calls
+		 * tp_segment_posting_iterator_load_block, which performs disk
+		 * I/O and possibly block decompression. Under the cache-
+		 * inconsistency scenario this function defends against, the
+		 * loop can iterate across many blocks. Without this CHECK,
+		 * statement_timeout / pg_cancel_backend cannot abort the
+		 * scan, and seek_to_pivot's CHECK_FOR_INTERRUPTS one level up
+		 * never fires because we never return from this function.
+		 */
+		CHECK_FOR_INTERRUPTS();
+
+		while (ts->iter.current_in_block < ts->iter.skip_entry.doc_count)
+		{
+			uint32 doc_id =
+					ts->iter.block_postings[ts->iter.current_in_block].doc_id;
+			if (doc_id >= target_doc_id)
+			{
+				ts->cur_doc_id = doc_id;
+				return true;
+			}
+			ts->iter.current_in_block++;
+		}
+
 		ts->iter.current_block++;
 		if (ts->iter.current_block >= ts->iter.dict_entry.block_count)
 		{
@@ -915,77 +1030,13 @@ seek_term_to_doc(TpTermState *ts, uint32 target_doc_id)
 			return false;
 		}
 		ts->iter.current_in_block = 0;
-		tp_segment_posting_iterator_load_block(&ts->iter);
-		refresh_cur_doc_id(ts);
-		return !ts->iter.finished;
-	}
-
-	/*
-	 * Target is beyond current block - binary search on cached last_doc_ids.
-	 * This is pure in-memory search, no I/O until we load the target block.
-	 */
-	block_count = ts->iter.dict_entry.block_count;
-
-	/* Binary search: find first block where last_doc_id >= target */
-	left  = ts->iter.current_block + 1; /* Start after current block */
-	right = block_count - 1;
-
-	while (left < right)
-	{
-		mid = left + (right - left) / 2;
-
-		if (ts->block_last_doc_ids[mid] < target_doc_id)
-			left = mid + 1;
-		else
-			right = mid;
-	}
-
-	target_block = left;
-
-	/* Check if target is past all blocks */
-	if (target_block >= block_count)
-	{
-		ts->iter.finished = true;
-		ts->cur_doc_id	  = UINT32_MAX;
-		return false;
-	}
-
-	/* Load the target block */
-	ts->iter.current_block	  = target_block;
-	ts->iter.current_in_block = 0;
-
-	if (!tp_segment_posting_iterator_load_block(&ts->iter))
-	{
-		ts->iter.finished = true;
-		ts->cur_doc_id	  = UINT32_MAX;
-		return false;
-	}
-
-	/* Linear scan within block to find target or first doc >= target */
-	while (ts->iter.current_in_block < ts->iter.skip_entry.doc_count)
-	{
-		uint32 doc_id =
-				ts->iter.block_postings[ts->iter.current_in_block].doc_id;
-		if (doc_id >= target_doc_id)
+		if (!tp_segment_posting_iterator_load_block(&ts->iter))
 		{
-			ts->cur_doc_id = doc_id;
-			return true;
+			ts->iter.finished = true;
+			ts->cur_doc_id	  = UINT32_MAX;
+			return false;
 		}
-		ts->iter.current_in_block++;
 	}
-
-	/* Target not in this block, try next */
-	ts->iter.current_block++;
-	if (ts->iter.current_block >= block_count)
-	{
-		ts->iter.finished = true;
-		ts->cur_doc_id	  = UINT32_MAX;
-		return false;
-	}
-	ts->iter.current_in_block = 0;
-	tp_segment_posting_iterator_load_block(&ts->iter);
-	refresh_cur_doc_id(ts);
-	return !ts->iter.finished;
 }
 
 /*
@@ -1246,12 +1297,18 @@ compute_block_max_at_pivot(TpTermState **terms, int pivot_len)
 /*
  * When block-max upper bound < threshold, advance one scorer.
  *
- * Strategy (following Tantivy):
- * 1. Find the term with highest max_score among pivot terms
- * 2. Find the minimum last_doc_id of current blocks among
- *    pivot terms (next interesting boundary)
- * 3. Seek that term to min(boundary+1, first non-pivot doc)
- * 4. Restore sorted order
+ * We pick the pivot term whose current block ends *soonest*
+ * (min_block_end), because seeking that term to min_block_end+1
+ * is guaranteed to advance it past its current block boundary,
+ * which guarantees forward progress of the outer WAND loop.
+ *
+ * A previous version picked the pivot term with the highest
+ * max_score and seeked it to min_block_end+1. That term's
+ * cur_doc_id could be greater than min_block_end+1, in which
+ * case seek_term_to_doc was a no-op and the outer WAND loop
+ * would spin forever (issue #355). High-max-score selection is
+ * a performance heuristic; forward progress is the correctness
+ * requirement.
  */
 static void
 block_max_skip_advance(
@@ -1261,13 +1318,12 @@ block_max_skip_advance(
 		int			 *active_count,
 		TpBMWStats	 *stats)
 {
-	int	   best_scorer	  = -1;
-	float4 best_max_score = -1.0f;
-	uint32 min_block_end  = UINT32_MAX;
+	int	   seek_term_idx = -1;
+	uint32 min_block_end = UINT32_MAX;
 	uint32 seek_target;
 	int	   i;
 
-	/* Find scorer with highest max_score and minimum block end */
+	/* Find pivot term whose current block ends soonest. */
 	for (i = 0; i < pivot_len; i++)
 	{
 		TpTermState *ts = terms[i];
@@ -1279,28 +1335,33 @@ block_max_skip_advance(
 		if (doc_id == UINT32_MAX)
 			continue;
 
-		if (terms[i]->max_score > best_max_score)
-		{
-			best_max_score = terms[i]->max_score;
-			best_scorer	   = i;
-		}
-
 		block = ts->iter.current_block;
 		if (ts->block_last_doc_ids != NULL &&
 			block < ts->iter.dict_entry.block_count)
 		{
 			block_last = ts->block_last_doc_ids[block];
 			if (block_last < min_block_end)
+			{
 				min_block_end = block_last;
+				seek_term_idx = i;
+			}
+		}
+		else if (seek_term_idx < 0)
+		{
+			/*
+			 * Fallback: term has no cached block_last_doc_ids.
+			 * Pick the first such term so we still make progress.
+			 */
+			seek_term_idx = i;
 		}
 	}
 
-	if (best_scorer < 0)
+	if (seek_term_idx < 0)
 		return;
 
-	/* Seek target: past current blocks, capped by non-pivot */
+	/* Seek target: past the chosen term's current block. */
 	if (min_block_end == UINT32_MAX)
-		seek_target = term_current_doc_id(terms[best_scorer]) + 1;
+		seek_target = term_current_doc_id(terms[seek_term_idx]) + 1;
 	else
 		seek_target = min_block_end + 1;
 
@@ -1312,17 +1373,37 @@ block_max_skip_advance(
 			seek_target = next_doc;
 	}
 
-	/* Seek the best scorer */
-	if (!seek_term_to_doc(terms[best_scorer], seek_target))
-		(*active_count)--;
-
-	restore_ordering(terms, term_count, best_scorer);
-
-	if (stats)
+	/*
+	 * Defense-in-depth: seek_term_to_doc(target <= cur_doc_id)
+	 * is a no-op and would leave us in an infinite loop. The
+	 * selection above guarantees forward progress in the normal
+	 * case (the min-block-end term is by construction at
+	 * cur_doc_id <= min_block_end < seek_target), but the
+	 * non-pivot cap above can pull seek_target back to next_doc,
+	 * which can equal the chosen term's cur_doc_id when
+	 * pivot_doc_id and next_doc coincide on a tie boundary. In
+	 * that edge case force a single posting advance to guarantee
+	 * progress.
+	 */
+	if (seek_target <= term_current_doc_id(terms[seek_term_idx]))
 	{
-		stats->blocks_skipped++;
-		stats->seeks_performed++;
+		if (!advance_term_iterator(terms[seek_term_idx]))
+			(*active_count)--;
+		if (stats)
+			stats->blocks_skipped++;
 	}
+	else
+	{
+		if (!seek_term_to_doc(terms[seek_term_idx], seek_target))
+			(*active_count)--;
+		if (stats)
+		{
+			stats->blocks_skipped++;
+			stats->seeks_performed++;
+		}
+	}
+
+	restore_ordering(terms, term_count, seek_term_idx);
 }
 
 /*
@@ -1342,7 +1423,22 @@ seek_to_pivot(
 
 	for (i = 0; i < pivot_len; i++)
 	{
-		uint32 doc_id = term_current_doc_id(terms[i]);
+		uint32 doc_id;
+
+		/*
+		 * Cancelability: the for loop's `i--; continue;` re-entry
+		 * pattern, combined with restore_ordering rotating terms
+		 * through slot `i`, was the gdb-observed spin site for the
+		 * MS MARCO bucket-8 hang. The underlying cause (seek_term_to_doc
+		 * returning true without advancing past target) is now fixed at
+		 * the source, but keep this CHECK so any future regression in
+		 * BMW invariants is interruptible from SQL rather than
+		 * requiring SIGKILL. (The outer WAND loop's CFI is too coarse:
+		 * if seek_to_pivot fails to terminate it never returns there.)
+		 */
+		CHECK_FOR_INTERRUPTS();
+
+		doc_id = term_current_doc_id(terms[i]);
 
 		if (doc_id == UINT32_MAX)
 		{
@@ -1490,14 +1586,42 @@ score_segment_multi_term_bmw(
 		/*
 		 * Step 3: Block-max refinement.
 		 * Check if block-level upper bound still beats threshold.
+		 *
+		 * Correctness note (#365): block_max_skip_advance() advances
+		 * a pivot term past its current block via seek_term_to_doc.
+		 * Docs in the skipped block that exist in *non-pivot* terms'
+		 * posting lists too can still be top-K candidates -- their
+		 * total true score includes non-pivot term contributions
+		 * that the pivot's block_upper alone doesn't capture.
+		 *
+		 * The safe-skip condition is therefore:
+		 *   block_upper(pivot) + max_score_sum(non-pivot) <= threshold
+		 * (an upper bound on a hypothetical doc's score using
+		 * pivot terms' actual block-max plus non-pivot terms' global
+		 * max). Only then can we skip without losing a top-K
+		 * candidate -- or under-scoring one we later see via another
+		 * pivot, after a relevant term already jumped over it.
 		 */
 		block_upper = compute_block_max_at_pivot(terms, pivot_len);
 
-		if (block_upper <= threshold)
 		{
-			block_max_skip_advance(
-					terms, term_count, pivot_len, &active_count, stats);
-			continue;
+			float4 non_pivot_max = 0.0f;
+			int	   np;
+
+			for (np = pivot_len; np < term_count; np++)
+			{
+				TpTermState *ts = terms[np];
+				if (!ts->found || ts->iter.finished)
+					continue;
+				non_pivot_max += ts->max_score;
+			}
+
+			if ((block_upper + non_pivot_max) <= threshold)
+			{
+				block_max_skip_advance(
+						terms, term_count, pivot_len, &active_count, stats);
+				continue;
+			}
 		}
 
 		if (stats)
