@@ -2325,26 +2325,50 @@ tp_insert(
 		document_text = tp_normalize_markup(
 				document_text, (TpContentFormat)field_formats_ins[col]);
 
-		if (OidIsValid(text_config_oid))
+		if (VARSIZE_ANY_EXHDR(document_text) <= TP_TSVECTOR_CHUNK_BYTES ||
+			!OidIsValid(text_config_oid))
 		{
-			tsvector_datum = DirectFunctionCall2(
-					to_tsvector_byid,
-					ObjectIdGetDatum(text_config_oid),
-					PointerGetDatum(document_text));
+			/*
+			 * Small document (or no text config): tsvector path,
+			 * preserving positions for phrase queries.
+			 */
+			if (OidIsValid(text_config_oid))
+			{
+				tsvector_datum = DirectFunctionCall2(
+						to_tsvector_byid,
+						ObjectIdGetDatum(text_config_oid),
+						PointerGetDatum(document_text));
+			}
+			else
+			{
+				tsvector_datum = DirectFunctionCall1(
+						to_tsvector, PointerGetDatum(document_text));
+			}
+			tsvector = DatumGetTSVector(tsvector_datum);
+
+			col_doc_length = tp_extract_terms_from_tsvector(
+					tsvector,
+					&col_terms,
+					&col_frequencies,
+					&col_positions,
+					&col_term_count);
 		}
 		else
 		{
-			tsvector_datum = DirectFunctionCall1(
-					to_tsvector, PointerGetDatum(document_text));
+			/*
+			 * Oversized document: chunked tokenization to fit the
+			 * tsvector 1 MB lexeme-dictionary cap. Positions cannot be
+			 * reliably merged across chunks, so they are omitted.
+			 * Mirrors the serial build callback's oversized path.
+			 */
+			col_positions  = NULL;
+			col_doc_length = tp_tokenize_text(
+					document_text,
+					text_config_oid,
+					&col_terms,
+					&col_frequencies,
+					&col_term_count);
 		}
-		tsvector = DatumGetTSVector(tsvector_datum);
-
-		col_doc_length = tp_extract_terms_from_tsvector(
-				tsvector,
-				&col_terms,
-				&col_frequencies,
-				&col_positions,
-				&col_term_count);
 
 		if (multi_col && col_term_count > 0)
 		{
