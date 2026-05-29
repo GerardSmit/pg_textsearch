@@ -22,6 +22,7 @@
 -- regression that reintroduces a no-op-seek hang is caught quickly
 -- rather than burning the whole test run.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+INFO:  pg_textsearch v2.0.0
 SET enable_seqscan = off;
 SET statement_timeout = '30s';
 CREATE TABLE bmw_skip_advance (id serial PRIMARY KEY, content text);
@@ -61,7 +62,7 @@ SELECT count(*) AS got_results FROM (
         'alpha beta gamma delta', 'bmw_skip_advance_idx')
     LIMIT 10
 ) sub;
- got_results
+ got_results 
 -------------
           10
 (1 row)
@@ -78,7 +79,7 @@ SELECT count(*) AS got_results FROM (
         'alpha beta gamma delta', 'bmw_skip_advance_idx')
     LIMIT 10
 ) sub;
- got_results
+ got_results 
 -------------
           10
 (1 row)
@@ -100,7 +101,7 @@ SELECT count(*) FROM (
         'extra_memtable_token', 'bmw_skip_advance_idx')
     LIMIT 5
 ) sub;
- count
+ count 
 -------
      5
 (1 row)
@@ -112,7 +113,7 @@ SELECT count(*) FROM (
         'alpha extra_memtable_token', 'bmw_skip_advance_idx')
     LIMIT 5
 ) sub;
- count
+ count 
 -------
      5
 (1 row)

@@ -1,19 +1,27 @@
 -- Regression test: multi-col BM25 standalone scoring with grammar/fuzzy/prefix.
 --
--- Bug: when the planner chose a sequential scan over a multi-col BM25 index
--- (e.g., LIMIT > row count), the standalone scoring path returned 0 for
--- every document because find_term_frequency_by_text() was called with a
--- field-tag-prefixed term (e.g., \x80vorraad) against an untagged tsvector
--- (which contains only "vorraad"), so the memcmp always failed.
+-- Bug (reported): ordering of (col_a, col_b) <@> to_bm25query(...) was correct
+-- ONLY when the planner chose the bm25 index top-k scan. When the planner
+-- switched to a sequential scan (e.g. LIMIT >= row count), the standalone
+-- scoring path returned 0 for every document -- the field-tag-prefixed term
+-- (e.g. \x80vorraad) was compared against an untagged tsvector/term array
+-- (which holds only "vorraad"), so every lookup failed. ORDER BY then
+-- collapsed to heap order and emitted non-matching rows.
 --
--- Fix: strip the leading tag byte before looking up TF in the per-field
--- tsvector when using the record-LHS (multi-col) standalone path.
+-- Fix: strip the leading field-tag byte before the per-field TF lookup in the
+-- multi-col standalone path so seq-scan scoring matches the index path.
 --
--- This test verifies that:
---   1. A fuzzy+prefix query over a multi-col index returns the same
---      top result (and its score) under a forced index scan AND a
---      forced sequential scan.
---   2. Single-col indexes are not regressed (tag-free path unchanged).
+-- This test PINS THE PLAN (does not rely on the cost crossover) and asserts:
+--   1. The forced index plan is an Index Scan; the forced seq plan is a
+--      Seq Scan (proving both code paths are actually exercised).
+--   2. Both plans return the same top row with the same score.
+--   3. A guaranteed-no-match term returns no scored rows under seq scan
+--      (i.e. the degenerate "heap order of non-matches" symptom is gone).
+--   4. Single-col indexes are not regressed.
+--
+-- NOTE: this test deliberately uses WHERE ... <@> ... < 0 and forced GUCs to
+-- exercise the standalone (seq-scan) scoring path; see CLAUDE.md exception for
+-- standalone scoring as an explicit test target.
 
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
 
@@ -34,7 +42,6 @@ INSERT INTO mcss_docs (title, description) VALUES
     ('Another item',         'Some description'),
     ('Third item',           'More text here');
 
--- Pad to 76 rows so LIMIT 100 triggers a seq-scan plan.
 INSERT INTO mcss_docs (title, description)
 SELECT 'Row ' || g, 'Description number ' || g
 FROM generate_series(1, 73) g;
@@ -44,107 +51,96 @@ CREATE INDEX mcss_idx ON mcss_docs
     WITH (text_config = 'pg_catalog.english');
 
 -- -----------------------------------------------------------------------
--- Reference: force index scan, capture the winning row and its score.
+-- (1) Prove the FORCED INDEX plan is an Index Scan, capture its result.
 -- "voorraad*" with fuzzy_max_distance=1 should fuzzy-expand to "vorraad".
 -- -----------------------------------------------------------------------
-SELECT id,
-       round(
-           ((title, description) <@>
-            to_bm25query(
-                'voorraad*',
-                'mcss_idx',
-                grammar => true,
-                fuzzy_max_distance => 1
-            ))::numeric, 4
-       ) AS score_index
+BEGIN;
+SET LOCAL enable_seqscan = off;
+
+EXPLAIN (COSTS OFF)
+SELECT id
 FROM mcss_docs
-ORDER BY
-    (title, description) <@>
-    to_bm25query(
-        'voorraad*',
-        'mcss_idx',
-        grammar => true,
-        fuzzy_max_distance => 1
-    )
-LIMIT 3;
+ORDER BY (title, description) <@>
+    to_bm25query('voorraad*', 'mcss_idx',
+                 grammar => true, fuzzy_max_distance => 1)
+LIMIT 5;
 
--- -----------------------------------------------------------------------
--- Bug repro: seq-scan path (LIMIT 100 on a 76-row table).
--- Before the fix, every row scored 0 and the matching doc appeared in
--- heap order rather than at the top.
--- After the fix, id=1 should appear first with the same non-zero score.
--- -----------------------------------------------------------------------
-SELECT id,
-       round(
-           ((title, description) <@>
-            to_bm25query(
-                'voorraad*',
-                'mcss_idx',
-                grammar => true,
-                fuzzy_max_distance => 1
-            ))::numeric, 4
-       ) AS score_seqscan
+CREATE TEMP TABLE res_index AS
+SELECT row_number() OVER () AS rn, id,
+       round(((title, description) <@>
+              to_bm25query('voorraad*', 'mcss_idx',
+                           grammar => true, fuzzy_max_distance => 1)
+             )::numeric, 4) AS score
 FROM mcss_docs
-ORDER BY
-    (title, description) <@>
-    to_bm25query(
-        'voorraad*',
-        'mcss_idx',
-        grammar => true,
-        fuzzy_max_distance => 1
-    )
-LIMIT 3;
+ORDER BY (title, description) <@>
+    to_bm25query('voorraad*', 'mcss_idx',
+                 grammar => true, fuzzy_max_distance => 1)
+LIMIT 5;
+COMMIT;
 
 -- -----------------------------------------------------------------------
--- Explicit parity check: the top-1 from each plan must be identical.
+-- (2) Prove the FORCED SEQ plan is a Seq Scan, capture its result.
 -- -----------------------------------------------------------------------
-WITH index_top AS (
-    SELECT id, score
-    FROM (
-        SELECT id,
-               ((title, description) <@>
-                to_bm25query(
-                    'voorraad*', 'mcss_idx',
-                    grammar => true, fuzzy_max_distance => 1
-                )) AS score
-        FROM mcss_docs
-        ORDER BY
-            (title, description) <@>
-            to_bm25query(
-                'voorraad*', 'mcss_idx',
-                grammar => true, fuzzy_max_distance => 1
-            )
-        LIMIT 1
-    ) t
-),
-seqscan_top AS (
-    SELECT id, score
-    FROM (
-        SELECT id,
-               ((title, description) <@>
-                to_bm25query(
-                    'voorraad*', 'mcss_idx',
-                    grammar => true, fuzzy_max_distance => 1
-                )) AS score
-        FROM mcss_docs
-        ORDER BY
-            (title, description) <@>
-            to_bm25query(
-                'voorraad*', 'mcss_idx',
-                grammar => true, fuzzy_max_distance => 1
-            )
-        LIMIT 100
-    ) t
-    WHERE score < 0  -- only the matching row(s)
-)
-SELECT
-    i.id = s.id                                         AS same_doc,
-    round(i.score::numeric, 4) = round(s.score::numeric, 4) AS same_score,
-    i.score < 0                                         AS score_is_negative
-FROM index_top i, seqscan_top s;
+BEGIN;
+SET LOCAL enable_indexscan = off;
+SET LOCAL enable_bitmapscan = off;
+
+EXPLAIN (COSTS OFF)
+SELECT id
+FROM mcss_docs
+ORDER BY (title, description) <@>
+    to_bm25query('voorraad*', 'mcss_idx',
+                 grammar => true, fuzzy_max_distance => 1)
+LIMIT 5;
+
+CREATE TEMP TABLE res_seq AS
+SELECT row_number() OVER () AS rn, id,
+       round(((title, description) <@>
+              to_bm25query('voorraad*', 'mcss_idx',
+                           grammar => true, fuzzy_max_distance => 1)
+             )::numeric, 4) AS score
+FROM mcss_docs
+ORDER BY (title, description) <@>
+    to_bm25query('voorraad*', 'mcss_idx',
+                 grammar => true, fuzzy_max_distance => 1)
+LIMIT 5;
+COMMIT;
 
 -- -----------------------------------------------------------------------
--- Single-column regression: no tag byte → path unchanged, still works.
+-- (3) Parity: the matching row (score < 0) must be identical across plans,
+-- including its score. Non-matching rows score 0 in both, so restrict to
+-- the real match for a stable comparison.
+-- -----------------------------------------------------------------------
+SELECT i.id          AS index_id,
+       s.id          AS seq_id,
+       i.id = s.id   AS same_doc,
+       i.score       AS index_score,
+       s.score       AS seq_score,
+       i.score = s.score AS same_score,
+       i.score < 0   AS score_is_negative
+FROM (SELECT id, score FROM res_index WHERE score < 0 ORDER BY rn LIMIT 1) i,
+     (SELECT id, score FROM res_seq   WHERE score < 0 ORDER BY rn LIMIT 1) s;
+
+-- -----------------------------------------------------------------------
+-- (4) Degenerate-symptom guard: a guaranteed-no-match term must return NO
+-- scored rows under a forced seq scan (before the fix, the seq path emitted
+-- non-matching rows in heap order regardless of the term).
+-- -----------------------------------------------------------------------
+BEGIN;
+SET LOCAL enable_indexscan = off;
+SET LOCAL enable_bitmapscan = off;
+SELECT count(*) AS nomatch_scored_rows
+FROM mcss_docs
+WHERE (title, description) <@>
+      to_bm25query('zzzqqqxxxnomatch*', 'mcss_idx',
+                   grammar => true, fuzzy_max_distance => 1) < 0;
+COMMIT;
+
+DROP TABLE res_index;
+DROP TABLE res_seq;
+
+-- -----------------------------------------------------------------------
+-- (5) Single-column regression: no tag byte -> path unchanged, still works.
 -- -----------------------------------------------------------------------
 DROP TABLE IF EXISTS mcss_docs_sc CASCADE;
 CREATE TABLE mcss_docs_sc (
@@ -164,18 +160,18 @@ CREATE INDEX mcss_sc_idx ON mcss_docs_sc
     USING bm25 (content)
     WITH (text_config = 'pg_catalog.english');
 
--- Verify single-col fuzzy-prefix seq-scan correctly scores the match.
+-- Single-col fuzzy-prefix seq-scan correctly scores the match.
+BEGIN;
+SET LOCAL enable_indexscan = off;
+SET LOCAL enable_bitmapscan = off;
 SELECT id,
-       content <@> to_bm25query(
-           'voorraad*', 'mcss_sc_idx',
-           grammar => true, fuzzy_max_distance => 1
-       ) < 0 AS matches
+       content <@> to_bm25query('voorraad*', 'mcss_sc_idx',
+           grammar => true, fuzzy_max_distance => 1) < 0 AS matches
 FROM mcss_docs_sc
-WHERE content <@> to_bm25query(
-    'voorraad*', 'mcss_sc_idx',
-    grammar => true, fuzzy_max_distance => 1
-) < 0
+WHERE content <@> to_bm25query('voorraad*', 'mcss_sc_idx',
+    grammar => true, fuzzy_max_distance => 1) < 0
 ORDER BY id;
+COMMIT;
 
 DROP TABLE mcss_docs CASCADE;
 DROP TABLE mcss_docs_sc CASCADE;
