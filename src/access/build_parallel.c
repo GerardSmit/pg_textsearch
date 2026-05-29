@@ -280,8 +280,6 @@ tp_parallel_build_worker_main(dsm_segment *seg, shm_toc *toc)
 	{
 		text	   *document_text;
 		ItemPointer ctid;
-		Datum		tsvector_datum;
-		TSVector	tsvector;
 		char	  **terms;
 		int32	   *frequencies;
 		uint32	  **positions = NULL;
@@ -319,15 +317,34 @@ tp_parallel_build_worker_main(dsm_segment *seg, shm_toc *toc)
 		document_text = tp_normalize_markup(
 				document_text, (TpContentFormat)shared->field_formats[0]);
 
-		tsvector_datum = DirectFunctionCall2Coll(
-				to_tsvector_byid,
-				InvalidOid,
-				ObjectIdGetDatum(shared->text_config_oid),
-				PointerGetDatum(document_text));
-		tsvector = DatumGetTSVector(tsvector_datum);
-
-		doc_length = tp_extract_terms_from_tsvector(
-				tsvector, &terms, &frequencies, &positions, &term_count);
+		if (VARSIZE_ANY_EXHDR(document_text) <= TP_TSVECTOR_CHUNK_BYTES)
+		{
+			/* Small document: normal path preserving positions. */
+			Datum	 tsvector_datum;
+			TSVector tsvector;
+			tsvector_datum = DirectFunctionCall2Coll(
+					to_tsvector_byid,
+					InvalidOid,
+					ObjectIdGetDatum(shared->text_config_oid),
+					PointerGetDatum(document_text));
+			tsvector   = DatumGetTSVector(tsvector_datum);
+			doc_length = tp_extract_terms_from_tsvector(
+					tsvector, &terms, &frequencies, &positions, &term_count);
+		}
+		else
+		{
+			/*
+			 * Oversized document: chunked tokenization to avoid the
+			 * tsvector 1 MB lexeme-dictionary cap. Positions cannot be
+			 * reliably merged across chunks, so they are omitted.
+			 */
+			doc_length = tp_tokenize_text(
+					document_text,
+					shared->text_config_oid,
+					&terms,
+					&frequencies,
+					&term_count);
+		}
 
 		MemoryContextSwitchTo(oldctx);
 

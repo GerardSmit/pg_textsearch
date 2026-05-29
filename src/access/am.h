@@ -147,6 +147,28 @@ int tp_extract_terms_from_tsvector(
 /* Free per-term position arrays from tp_extract_terms_from_tsvector. */
 void tp_free_term_positions(uint32 **positions, int term_count);
 
+/*
+ * Maximum input bytes per to_tsvector call. Postgres's tsvector caps the
+ * lexeme dictionary at 1 MB (MAXSTRPOS). 256 KB leaves comfortable
+ * headroom for stemming/case-fold expansion.
+ */
+#define TP_TSVECTOR_CHUNK_BYTES (256 * 1024)
+
+/*
+ * Tokenize a document into terms and frequencies. Handles documents whose
+ * lexeme volume would otherwise exceed Postgres's tsvector 1 MB cap by
+ * splitting on whitespace and merging per-chunk results.
+ *
+ * Output arrays are palloc'd in the current memory context. Returns
+ * doc_length (sum of frequencies). Positions are not returned.
+ */
+int tp_tokenize_text(
+		text   *document_text,
+		Oid		text_config_oid,
+		char ***terms_out,
+		int32 **frequencies_out,
+		int	   *term_count_out);
+
 /* Build progress tracking for partitioned tables */
 void tp_build_progress_begin(void);
 void tp_build_progress_end(void);
