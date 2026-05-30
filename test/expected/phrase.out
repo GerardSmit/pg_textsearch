@@ -2,7 +2,7 @@
 -- Validates parser, positional verifier (heap re-fetch), implicit OR
 -- behavior with mixed term + phrase clauses, and standalone scoring.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 DROP TABLE IF EXISTS phrase_docs;
 NOTICE:  table "phrase_docs" does not exist, skipping
 CREATE TABLE phrase_docs (id int PRIMARY KEY, body text);

@@ -5,7 +5,7 @@
 --   - field:term / field:"phrase" / field:prefix* scope correctly.
 --   - Unknown field name errors helpfully.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 -- enable_seqscan = off so the tiny demo table routes through the
 -- index scan instead of seq + bm25 scoring.
 SET enable_seqscan = off;

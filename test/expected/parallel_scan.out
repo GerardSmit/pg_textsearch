@@ -12,7 +12,7 @@
 --   5. Test single-term queries (eligible for parallel scan) and multi-term
 --      queries (should fall back to serial, still correct).
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 SET enable_seqscan = off;
 --------------------------------------------------------------------------------
 -- Setup: create table, index, and spill to produce multiple segments

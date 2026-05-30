@@ -2,7 +2,7 @@
 -- Validates parser, dictionary expansion (memtable + segments), expansion cap,
 -- error paths, and standalone scoring.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 DROP TABLE IF EXISTS prefix_docs;
 NOTICE:  table "prefix_docs" does not exist, skipping
 CREATE TABLE prefix_docs (id int PRIMARY KEY, body text);

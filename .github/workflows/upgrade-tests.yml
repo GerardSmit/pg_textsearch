@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         pg_version: [17, 18]
-        old_version: ['0.2.0', '0.3.0', '0.4.0', '0.4.1', '0.4.2', '0.5.0', '0.5.1', '0.6.0', '0.6.1', '1.0.0']
+        old_version: ['0.2.0', '0.3.0', '0.4.0', '0.4.1', '0.4.2', '0.5.0', '0.5.1', '0.6.0', '0.6.1', '1.0.0', '2.0.0']
 
     steps:
     - name: Checkout current code
@@ -42,8 +42,12 @@ jobs:
 
     - name: Download old release v${{ matrix.old_version }}
       run: |
-        # Download the source tarball from GitHub releases
-        DOWNLOAD_URL="https://github.com/timescale/pg_textsearch/releases/download/v${{ matrix.old_version }}/pg_textsearch-${{ matrix.old_version }}.tar.gz"
+        # Pre-fork releases live upstream; fork-local releases start at 2.0.0.
+        RELEASE_REPO="timescale/pg_textsearch"
+        if dpkg --compare-versions "${{ matrix.old_version }}" ge "2.0.0"; then
+          RELEASE_REPO="${{ github.repository }}"
+        fi
+        DOWNLOAD_URL="https://github.com/${RELEASE_REPO}/releases/download/v${{ matrix.old_version }}/pg_textsearch-${{ matrix.old_version }}.tar.gz"
         echo "Downloading from: $DOWNLOAD_URL"
         if curl -fsSL -o pg_textsearch-old.tar.gz "$DOWNLOAD_URL"; then
           tar -xzf pg_textsearch-old.tar.gz

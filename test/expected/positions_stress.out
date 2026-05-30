@@ -4,7 +4,7 @@
 --   2. Phrase queries across spill and merge
 --   3. High term frequency docs (long varint chains)
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 -- ============================================================
 -- 1. Large documents: many positions per term
 -- ============================================================

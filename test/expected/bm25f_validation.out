@@ -18,7 +18,7 @@
 --
 -- Index scan returns negative score so docs sort ascending.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 SET enable_seqscan = off;
 -- Lucene SmallFloat fieldnorm encode/decode in SQL.  Values 0-39
 -- map exactly; larger values are quantized.  Kept in step with

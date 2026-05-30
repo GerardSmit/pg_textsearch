@@ -20,7 +20,7 @@
 -- NOTE: deliberately uses WHERE ... <@> ... < 0 to drive standalone scoring
 -- as an explicit test target; see CLAUDE.md standalone-scoring exception.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 DROP TABLE IF EXISTS fuzzy_large CASCADE;
 NOTICE:  table "fuzzy_large" does not exist, skipping
 CREATE TABLE fuzzy_large (

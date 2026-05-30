@@ -29,7 +29,7 @@ Modern ranked text search for Postgres. Fork of [timescale/pg_textsearch](https:
 - **Parallel index scan** for 10M+ row indexes (up to 3x speedup)
 - **Docker image**: pgvector + pg_trgm pre-installed, auto-configured
 
-![Tapir and Friends](images/tapir_and_friends_v1.1.0.png)
+![Tapir and Friends](images/tapir_and_friends_v2.1.0.png)
 
 ## PostgreSQL Version Compatibility
 

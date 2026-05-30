@@ -3,7 +3,7 @@
 -- matches any indexed token starting with the prefix at the
 -- adjacent position.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 DROP TABLE IF EXISTS pp_docs;
 NOTICE:  table "pp_docs" does not exist, skipping
 CREATE TABLE pp_docs (id int PRIMARY KEY, body text);

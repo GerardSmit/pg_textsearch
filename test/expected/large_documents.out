@@ -1,7 +1,7 @@
 -- Test indexing of documents whose unique-token volume would otherwise
 -- exceed Postgres's tsvector 1 MB lexeme dictionary cap.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 SET client_min_messages = WARNING;
 -- Sanity: bare to_tsvector still rejects oversized inputs.
 DO $$

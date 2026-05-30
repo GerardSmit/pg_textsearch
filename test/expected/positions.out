@@ -3,7 +3,7 @@
 -- consumed by the phrase verifier via the index fast path (no heap
 -- re-fetch needed).
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 DROP TABLE IF EXISTS pos_docs;
 NOTICE:  table "pos_docs" does not exist, skipping
 CREATE TABLE pos_docs (id int PRIMARY KEY, body text);

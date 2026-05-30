@@ -2,7 +2,7 @@
 -- Validates typo-tolerant term and prefix expansion, memtable + segment
 -- dictionaries, normal query isolation, and error paths.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 DROP TABLE IF EXISTS fuzzy_docs;
 NOTICE:  table "fuzzy_docs" does not exist, skipping
 CREATE TABLE fuzzy_docs (id int PRIMARY KEY, body text);
@@ -104,7 +104,7 @@ DROP EXTENSION pg_textsearch CASCADE;
 -- Edge-case tests appended below
 -- =============================================================
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 -- 1. Fuzzy with field scope on a multi-column index.
 DROP TABLE IF EXISTS fuzzy_mc CASCADE;
 NOTICE:  table "fuzzy_mc" does not exist, skipping

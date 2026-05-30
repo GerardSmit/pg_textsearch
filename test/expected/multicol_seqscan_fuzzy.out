@@ -23,7 +23,7 @@
 -- exercise the standalone (seq-scan) scoring path; see CLAUDE.md exception for
 -- standalone scoring as an explicit test target.
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 -- -----------------------------------------------------------------------
 -- Setup: small table (~76 rows) with a multi-col BM25 index.
 -- "vorraad" (title col) is a 1-edit near-miss for "voorraad".

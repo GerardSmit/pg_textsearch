@@ -1,5 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS pg_textsearch;
-INFO:  pg_textsearch v2.0.0
+INFO:  pg_textsearch v2.1.0
 SET enable_seqscan = off;
 -- ============================================================
 -- 1. Default plain behavior (backward compatibility)
